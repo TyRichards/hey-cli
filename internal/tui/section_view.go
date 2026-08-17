@@ -54,3 +54,11 @@ type sectionView interface {
 	// Loading reports whether the section is waiting on data.
 	Loading() bool
 }
+
+// inputCapturer is implemented by section views that can open a text form.
+// While CapturingInput is true the app routes every key press (except the
+// ctrl+c quit chord, which is handled first) to sectionView.HandleContentKey
+// instead of treating any of them as global shortcuts.
+type inputCapturer interface {
+	CapturingInput() bool
+}
