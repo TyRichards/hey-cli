@@ -27,11 +27,11 @@ func newComposeCommand() *composeCommand {
 		Use:   "compose",
 		Short: "Compose a new message",
 		Annotations: map[string]string{
-			"agent_notes": "Creates a new email. Requires --subject. Use --to (optionally with --cc/--bcc) for new threads or --thread-id for existing ones.",
+			"agent_notes": "Starts a new thread with --to (optionally --cc/--bcc), which requires --subject, or replies to an existing one with --thread-id, which does not: a reply carries the thread's subject and goes to that thread's recipients.",
 		},
 		Example: `  hey compose --to alice@example.com --subject "Hello" -m "Hi there"
   hey compose --to alice@example.com --cc bob@example.com --bcc carol@example.org --subject "Hello" -m "Hi"
-  hey compose --subject "Update" --thread-id 12345 -m "Thread reply"
+  hey compose --thread-id 12345 -m "Thread reply"
   echo "Long message" | hey compose --to bob@example.com --subject "Report"`,
 		RunE: composeCommand.run,
 	}
@@ -39,9 +39,9 @@ func newComposeCommand() *composeCommand {
 	composeCommand.cmd.Flags().StringVar(&composeCommand.to, "to", "", "Recipient email address(es)")
 	composeCommand.cmd.Flags().StringVar(&composeCommand.cc, "cc", "", "CC recipient email address(es)")
 	composeCommand.cmd.Flags().StringVar(&composeCommand.bcc, "bcc", "", "BCC recipient email address(es)")
-	composeCommand.cmd.Flags().StringVar(&composeCommand.subject, "subject", "", "Message subject (required)")
+	composeCommand.cmd.Flags().StringVar(&composeCommand.subject, "subject", "", "Message subject (required for a new message)")
 	composeCommand.cmd.Flags().StringVarP(&composeCommand.message, "message", "m", "", "Message body (or opens $EDITOR)")
-	composeCommand.cmd.Flags().StringVar(&composeCommand.threadID, "thread-id", "", "Thread ID to post message to")
+	composeCommand.cmd.Flags().StringVar(&composeCommand.threadID, "thread-id", "", "Reply to this thread instead of starting a new one")
 
 	return composeCommand
 }
@@ -51,7 +51,8 @@ func (c *composeCommand) run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if c.subject == "" {
+	// A reply carries the thread's subject, so only a new message needs one.
+	if c.subject == "" && c.threadID == "" {
 		return output.ErrUsageHint("--subject is required", "hey compose --to <email> --subject <subject> -m <message>")
 	}
 
@@ -85,7 +86,12 @@ func (c *composeCommand) run(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return output.ErrUsage(fmt.Sprintf("invalid thread ID: %s", c.threadID))
 		}
-		if err := sdk.Messages().CreateTopicMessage(ctx, topicID, message); err != nil {
+		target, err := resolveThreadReply(ctx, topicID)
+		if err != nil {
+			return err
+		}
+		if err := sdk.Entries().CreateReply(ctx, target.EntryID, message,
+			target.Addressed.To, target.Addressed.CC, target.Addressed.BCC); err != nil {
 			return convertSDKError(err)
 		}
 	} else {
