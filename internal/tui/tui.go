@@ -38,6 +38,7 @@ type model struct {
 
 	// Section views (kept alive for state preservation)
 	mailView     *mailView
+	contactsView *contactsView
 	calendarView *calendarView
 	journalView  *journalView
 
@@ -54,6 +55,7 @@ func newModel(sdk *hey.Client) model {
 	vc := &viewContext{sdk: sdk, ctx: ctx, styles: s}
 
 	mv := newMailView(vc)
+	ov := newContactsView(vc)
 	cv := newCalendarView(vc)
 	jv := newJournalView(vc)
 
@@ -66,6 +68,7 @@ func newModel(sdk *hey.Client) model {
 		focus:        rowContent,
 		activeView:   mv,
 		mailView:     mv,
+		contactsView: ov,
 		calendarView: cv,
 		journalView:  jv,
 		loading:      true,
@@ -115,7 +118,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 	}
 
-	// Delegate to active section view
+	// Delegate to the active section view.
 	cmd, consumed := m.activeView.Update(msg)
 	if consumed {
 		cmd = m.syncLoading(cmd)
@@ -206,7 +209,7 @@ func (m *model) updateHelpBindings() {
 			bindings = []helpBinding{
 				{"←→", "section"},
 				{"tab", "next row"},
-				{"shift+M/C/J", "jump"},
+				{"shift+M/O/C/J", "jump"},
 				quitHint,
 			}
 		case rowSubnav:
@@ -277,6 +280,10 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if m.loading {
+		return m, nil
+	}
+
 	if msg.Key().Code == tea.KeyTab {
 		if msg.Key().Mod == tea.ModShift {
 			m.focus = (m.focus + 2) % 3
@@ -322,6 +329,8 @@ func (m model) switchSection(sec section) (tea.Model, tea.Cmd) {
 	switch sec {
 	case sectionMail:
 		m.activeView = m.mailView
+	case sectionContacts:
+		m.activeView = m.contactsView
 	case sectionCalendar:
 		m.activeView = m.calendarView
 	case sectionJournal:

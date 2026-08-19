@@ -199,6 +199,43 @@ func TestSingleCtrlCDoesNotQuit(t *testing.T) {
 	}
 }
 
+func TestLoadingViewKeepsItsSectionUntilResponse(t *testing.T) {
+	m := modelWithBoxes()
+	m.loading = true
+	m.mailView.loading = true
+
+	updated, cmd := m.Update(keyPress("O"))
+	result := updated.(model)
+	if result.activeView != result.mailView || result.section != sectionMail {
+		t.Error("section changed while the active view was loading")
+	}
+	if cmd != nil {
+		t.Error("section shortcut should not start another request while loading")
+	}
+}
+
+func TestContactsSectionShortcut(t *testing.T) {
+	m := modelWithBoxes()
+	updated, cmd := m.Update(keyPress("O"))
+	result := updated.(model)
+	if result.section != sectionContacts || result.activeView != result.contactsView {
+		t.Errorf("O shortcut selected section %d and view %T", result.section, result.activeView)
+	}
+	if cmd == nil || !result.loading {
+		t.Error("opening Contacts should start its initial list request")
+	}
+}
+
+func TestSectionNavigationIncludesContacts(t *testing.T) {
+	m := modelWithBoxes()
+	m.focus = rowSection
+	updated, _ := m.Update(keyPress("right"))
+	result := updated.(model)
+	if result.section != sectionContacts {
+		t.Errorf("right from Mail selected section %d, want Contacts", result.section)
+	}
+}
+
 // --- Navigation: Esc/q in thread goes back ---
 
 func TestThreadHelpIncludesMailActions(t *testing.T) {
