@@ -6,6 +6,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/basecamp/hey-cli/internal/models"
 )
@@ -253,6 +254,83 @@ func TestMovePickerOwnsNavigationKeys(t *testing.T) {
 	}
 }
 
+func TestSearchFormOwnsNavigationKeys(t *testing.T) {
+	m := modelWithBoxes()
+	m.focus = rowContent
+
+	updated, _ := m.Update(keyPress("/"))
+	m = updated.(model)
+	if m.mailView.searchForm == nil || !m.mailView.CapturingInput() {
+		t.Fatal("/ should open the search form")
+	}
+
+	updated, _ = m.Update(keyPress("tab"))
+	m = updated.(model)
+	if m.focus != rowContent || m.mailView.searchForm == nil {
+		t.Error("tab should remain inside the search form")
+	}
+
+	updated, _ = m.Update(keyPress("esc"))
+	m = updated.(model)
+	if m.mailView.searchForm != nil || m.mailView.CapturingInput() {
+		t.Error("escape should close the search form")
+	}
+}
+
+func TestQExitsSearchResults(t *testing.T) {
+	m := modelWithBoxes()
+	m.mailView.searchActive = true
+	m.mailView.searchQuery = "quarterly planning"
+	m.mailView.notice = "No more search results"
+
+	updated, _ := m.Update(keyPress("q"))
+	result := updated.(model)
+	if result.mailView.searchActive || result.activeView.InThread() {
+		t.Error("q should exit search results")
+	}
+	if result.mailView.notice != "" {
+		t.Errorf("q left a stale search notice: %q", result.mailView.notice)
+	}
+}
+
+func TestEscCancelsPendingSearchResultAndPreservesResults(t *testing.T) {
+	m := modelWithBoxes()
+	m.mailView.searchActive = true
+	m.mailView.searchQuery = "quarterly planning"
+	m.mailView.searchPage = 1
+	m.mailView.searchList.setPostings([]models.Posting{{ID: 10, TopicID: 100, Name: "Hello world"}})
+	m.mailView.requestTopic(m.mailView.currentBoxID(), 100, "Hello world")
+	m.loading = true
+
+	updated, _ := m.Update(keyPress("esc"))
+	result := updated.(model)
+	if !result.mailView.searchActive || result.mailView.searchQuery != "quarterly planning" || len(result.mailView.searchList.postings) != 1 {
+		t.Error("escape during thread load should preserve search results")
+	}
+	if result.mailView.loading || result.loading {
+		t.Error("escape should cancel the pending thread load")
+	}
+}
+
+func TestQExitsSearchDuringPendingResult(t *testing.T) {
+	m := modelWithBoxes()
+	m.mailView.searchActive = true
+	m.mailView.searchQuery = "quarterly planning"
+	m.mailView.searchPage = 1
+	m.mailView.searchList.setPostings([]models.Posting{{ID: 10, TopicID: 100, Name: "Hello world"}})
+	m.mailView.requestTopic(m.mailView.currentBoxID(), 100, "Hello world")
+	m.loading = true
+
+	updated, _ := m.Update(keyPress("q"))
+	result := updated.(model)
+	if result.mailView.searchActive || len(result.mailView.searchList.postings) != 0 {
+		t.Error("q during thread load should exit search results")
+	}
+	if result.mailView.loading || result.loading {
+		t.Error("q should cancel the pending thread load")
+	}
+}
+
 func TestEscExitsThread(t *testing.T) {
 	m := modelWithBoxes()
 	m.mailView.inThread = true
@@ -406,6 +484,15 @@ func TestContentListSelectedPosting(t *testing.T) {
 }
 
 // --- View rendering ---
+
+func TestRenderRuleBoundsLongLabels(t *testing.T) {
+	for _, width := range []int{1, 10, 24} {
+		rule := renderRule(width, "Search: a query that is much wider than the terminal (page 1)")
+		if got := lipgloss.Width(rule); got != width {
+			t.Errorf("renderRule(%d) width = %d, want %d: %q", width, got, width, rule)
+		}
+	}
+}
 
 func TestViewShowsHeader(t *testing.T) {
 	m := modelWithBoxes()
