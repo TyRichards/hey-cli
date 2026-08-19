@@ -261,7 +261,11 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.activeView.ExitThread()
 			m.updateHelpBindings()
 			m.activeView.Resize(m.vc.width, m.vc.height)
-			return m, nil
+			return m, m.syncLoading(nil)
+		}
+		if canceler, ok := m.activeView.(pendingDetailCanceler); ok && canceler.CancelPendingDetail() {
+			m.updateHelpBindings()
+			return m, m.syncLoading(nil)
 		}
 		return m, nil
 	}
@@ -358,8 +362,8 @@ func formatTimestamp(ts time.Time) string {
 
 var imageHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
-func fetchImageData(imgURL string) []byte {
-	req, err := http.NewRequestWithContext(context.Background(), "GET", imgURL, nil)
+func fetchImageData(ctx context.Context, imgURL string) []byte {
+	req, err := http.NewRequestWithContext(ctx, "GET", imgURL, nil)
 	if err != nil {
 		return nil
 	}
