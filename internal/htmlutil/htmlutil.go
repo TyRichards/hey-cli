@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	stdhtml "html"
+	"strconv"
 	"strings"
 
 	"golang.org/x/net/html"
@@ -46,6 +47,26 @@ func ExtractImageURLs(s string) []string {
 	var urls []string
 	findImages(doc, &urls)
 	return urls
+}
+
+// Attachment describes a downloadable file embedded in rich-text content.
+type Attachment struct {
+	URL         string
+	Filename    string
+	ContentType string
+	ByteSize    *int64
+	SGID        string
+}
+
+// ExtractAttachments returns downloadable files in their document order.
+func ExtractAttachments(s string) []Attachment {
+	doc, err := html.Parse(strings.NewReader(s))
+	if err != nil {
+		return nil
+	}
+	var attachments []Attachment
+	findAttachments(doc, &attachments)
+	return attachments
 }
 
 func walkNode(b *strings.Builder, n *html.Node) {
@@ -103,6 +124,8 @@ type trixAttachment struct {
 	URL         string `json:"url"`
 	Filename    string `json:"filename"`
 	ContentType string `json:"contentType"`
+	Filesize    *int64 `json:"filesize"`
+	SGID        string `json:"sgid"`
 }
 
 func parseTrixAttachment(n *html.Node) *trixAttachment {
@@ -135,6 +158,56 @@ func walkChildren(b *strings.Builder, n *html.Node) {
 	}
 }
 
+func findAttachments(n *html.Node, attachments *[]Attachment) {
+	if n.Type == html.ElementNode {
+		switch n.Data {
+		case "action-text-attachment":
+			byteSize := parseAttachmentByteSize(getAttr(n, "filesize"))
+			attachment := Attachment{
+				URL:         getAttr(n, "url"),
+				Filename:    getAttr(n, "filename"),
+				ContentType: getAttr(n, "content-type"),
+				ByteSize:    byteSize,
+				SGID:        getAttr(n, "sgid"),
+			}
+			if attachment.URL != "" && attachment.Filename != "" {
+				*attachments = append(*attachments, attachment)
+			}
+		case "figure":
+			if trix := parseTrixAttachment(n); trix != nil && trix.URL != "" {
+				*attachments = append(*attachments, Attachment{
+					URL:         trix.URL,
+					Filename:    trix.Filename,
+					ContentType: trix.ContentType,
+					ByteSize:    nonnegativeAttachmentByteSize(trix.Filesize),
+					SGID:        trix.SGID,
+				})
+			}
+		}
+	}
+	for child := n.FirstChild; child != nil; child = child.NextSibling {
+		findAttachments(child, attachments)
+	}
+}
+
+func parseAttachmentByteSize(value string) *int64 {
+	if value == "" {
+		return nil
+	}
+	size, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || size < 0 {
+		return nil
+	}
+	return &size
+}
+
+func nonnegativeAttachmentByteSize(size *int64) *int64 {
+	if size == nil || *size < 0 {
+		return nil
+	}
+	return size
+}
+
 func findImages(n *html.Node, urls *[]string) {
 	if n.Type == html.ElementNode {
 		switch n.Data {
@@ -143,6 +216,11 @@ func findImages(n *html.Node, urls *[]string) {
 				if a.Key == "src" && a.Val != "" {
 					*urls = append(*urls, a.Val)
 				}
+			}
+		case "action-text-attachment":
+			contentType := strings.ToLower(strings.TrimSpace(getAttr(n, "content-type")))
+			if imageURL := getAttr(n, "url"); strings.HasPrefix(contentType, "image/") && imageURL != "" {
+				*urls = append(*urls, imageURL)
 			}
 		case "figure":
 			if att := parseTrixAttachment(n); att != nil && att.URL != "" {

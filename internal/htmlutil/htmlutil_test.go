@@ -112,6 +112,44 @@ func TestPrependTextWithoutNote(t *testing.T) {
 	}
 }
 
+func TestExtractAttachments(t *testing.T) {
+	h := `<action-text-attachment sgid="sgid-1" url="/rails/blobs/report.pdf" filename="quarterly-report.pdf" content-type="application/pdf" filesize="128"></action-text-attachment>
+<figure data-trix-attachment='{"sgid":"sgid-2","url":"/rails/blobs/photo.png","filename":"photo.png","contentType":"image/png","filesize":256}'></figure>`
+	attachments := ExtractAttachments(h)
+	if len(attachments) != 2 {
+		t.Fatalf("ExtractAttachments got %d attachments, want 2", len(attachments))
+	}
+	if attachments[0].Filename != "quarterly-report.pdf" || attachments[0].ContentType != "application/pdf" || attachments[0].ByteSize == nil || *attachments[0].ByteSize != 128 || attachments[0].SGID != "sgid-1" {
+		t.Errorf("canonical attachment = %+v", attachments[0])
+	}
+	if attachments[1].Filename != "photo.png" || attachments[1].URL != "/rails/blobs/photo.png" || attachments[1].ByteSize == nil || *attachments[1].ByteSize != 256 || attachments[1].SGID != "sgid-2" {
+		t.Errorf("Trix attachment = %+v", attachments[1])
+	}
+}
+
+func TestExtractAttachmentsDistinguishesEmptyFromUnknownSize(t *testing.T) {
+	h := `<action-text-attachment url="/rails/blobs/empty.txt" filename="empty.txt" filesize="0"></action-text-attachment>
+<figure data-trix-attachment='{"url":"/rails/blobs/unknown.txt","filename":"unknown.txt"}'></figure>`
+	attachments := ExtractAttachments(h)
+	if len(attachments) != 2 {
+		t.Fatalf("ExtractAttachments got %d attachments, want 2", len(attachments))
+	}
+	if attachments[0].ByteSize == nil || *attachments[0].ByteSize != 0 {
+		t.Errorf("empty attachment size = %v", attachments[0].ByteSize)
+	}
+	if attachments[1].ByteSize != nil {
+		t.Errorf("unknown attachment size = %v", *attachments[1].ByteSize)
+	}
+}
+
+func TestExtractAttachmentsSkipsIncompleteElements(t *testing.T) {
+	h := `<action-text-attachment sgid="sgid-1" filename="missing-url.pdf"></action-text-attachment>
+<figure data-trix-attachment='{"url":"/rails/blobs/missing-name"}'></figure>`
+	if attachments := ExtractAttachments(h); len(attachments) != 0 {
+		t.Errorf("ExtractAttachments = %+v, want none", attachments)
+	}
+}
+
 func TestExtractImageURLs(t *testing.T) {
 	h := `<p>Hello</p><img src="https://example.com/a.png"><img src="https://example.com/b.jpg">`
 	urls := ExtractImageURLs(h)
@@ -137,6 +175,18 @@ func TestExtractImageURLsEmptySrc(t *testing.T) {
 	urls := ExtractImageURLs(`<img src="">`)
 	if len(urls) != 0 {
 		t.Errorf("ExtractImageURLs should skip empty src, got %d urls", len(urls))
+	}
+}
+
+func TestExtractImageURLsActionTextImage(t *testing.T) {
+	h := `<action-text-attachment url="/rails/blobs/photo.png" filename="photo.png" content-type="image/png"></action-text-attachment>
+<action-text-attachment url="/rails/blobs/report.pdf" filename="report.pdf" content-type="application/pdf"></action-text-attachment>`
+	urls := ExtractImageURLs(h)
+	if len(urls) != 1 {
+		t.Fatalf("ExtractImageURLs Action Text got %d urls, want 1", len(urls))
+	}
+	if urls[0] != "/rails/blobs/photo.png" {
+		t.Errorf("url[0] = %q, want %q", urls[0], "/rails/blobs/photo.png")
 	}
 }
 
