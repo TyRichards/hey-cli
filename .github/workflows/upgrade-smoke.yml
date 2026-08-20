@@ -1,0 +1,224 @@
+---
+# Upgrade smoke: installer legs pinning the cosign version→flag capability gate
+# against the REAL published bundle format of the latest release — real
+# download, real Sigstore verification. A native `hey upgrade` matrix joins
+# once the command exists.
+#
+# Branch pushes necessarily verify the previous release, so the workflow also
+# runs on every published release (pinned to that release's tag) -- the first
+# bundle a changed .goreleaser.yaml actually produces gets exercised. Normal
+# releases arrive as a workflow_dispatch from release.yml: goreleaser publishes
+# with the built-in GITHUB_TOKEN, whose release event never starts another
+# workflow. The `release: published` trigger covers releases published by a
+# person (e.g. a draft in the UI). Manual runs can pin a version too.
+name: Upgrade Smoke
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release to install (e.g. 1.2.3); empty means latest"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - ".goreleaser.yaml"
+      - "scripts/install.sh"
+      - "scripts/install.ps1"
+      - ".github/workflows/upgrade-smoke.yml"
+  pull_request:
+    paths:
+      - ".goreleaser.yaml"
+      - "scripts/install.sh"
+      - "scripts/install.ps1"
+      - ".github/workflows/upgrade-smoke.yml"
+
+permissions: {}
+
+concurrency:
+  group: upgrade-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # "v1.2.3" on release events, the input on workflow_dispatch, empty (latest)
+  # otherwise. The installers take the bare version; the "v" is stripped below.
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.version }}
+
+jobs:
+  # Until the first release is published there is nothing real to verify, and a
+  # permanently red canary blocks merges on a condition only a release can
+  # clear. The gate skips the legs with a visible warning instead — and
+  # self-arms: the moment a release exists (or a run pins a version), the legs
+  # run for real. Pinned runs bypass the probe on purpose: asking for a version
+  # that does not exist should fail loudly, not skip.
+  has-release:
+    name: Resolve release under test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      exists: ${{ steps.probe.outputs.exists }}
+    steps:
+      - name: Probe for a published release
+        id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "$RELEASE_TAG" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No published release yet — the upgrade smoke legs are skipped. They arm automatically once the first release is published."
+          fi
+
+  installer-sh:
+    name: install.sh cosign ${{ matrix.cosign }}
+    needs: [has-release]
+    if: needs.has-release.outputs.exists == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # sha256 values come from each cosign release's cosign_checksums.txt.
+        include:
+          - cosign: v3.0.5 # new bundle format is the default: bare verify-blob
+            sha256: db15cc99e6e4837daabab023742aaddc3841ce57f193d11b7c3e06c8003642b2
+            expect: verified
+          - cosign: v2.6.0 # floor for --new-bundle-format=true
+            sha256: ea5c65f99425d6cfbb5c4b5de5dac035f14d09131c1a0ea7c7fc32eab39364f9
+            expect: verified
+          - cosign: v2.4.0 # unsupported: warn + skip, install still succeeds
+            sha256: cd7636b3586a3bdac2d9c8f3b421ed119edcb20499107887fd929211110e8418
+            expect: skipped
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install cosign ${{ matrix.cosign }} (digest-pinned)
+        run: |
+          curl -fsSL -o /tmp/cosign \
+            "https://github.com/sigstore/cosign/releases/download/${{ matrix.cosign }}/cosign-linux-amd64"
+          echo "${{ matrix.sha256 }}  /tmp/cosign" | sha256sum -c -
+          chmod +x /tmp/cosign
+          sudo mv /tmp/cosign /usr/local/bin/cosign
+          cosign version
+
+      # goreleaser publishes the release before its assets finish uploading,
+      # so a release-triggered run waits for the bundle to appear.
+      - name: Wait for release assets
+        if: env.RELEASE_TAG != ''
+        run: |
+          tag="v${RELEASE_TAG#v}"
+          url="https://github.com/basecamp/hey-cli/releases/download/${tag}/checksums.txt.bundle"
+          for _ in $(seq 1 30); do
+            if curl -fsSIL "$url" >/dev/null; then exit 0; fi
+            sleep 20
+          done
+          echo "::error::${url} never appeared" >&2
+          exit 1
+
+      - name: Run install.sh against the release
+        env:
+          HEY_BIN_DIR: /home/runner/.local/bin
+          HEY_NO_KEYRING: "1"
+        run: |
+          set -o pipefail
+          export HEY_VERSION="${RELEASE_TAG#v}"
+          bash scripts/install.sh | tee install.log
+
+      - name: Assert the signature verification path
+        run: |
+          if [[ "${{ matrix.expect }}" == "verified" ]]; then
+            grep -q "Signature verified" install.log
+          else
+            grep -q "Skipping signature verification" install.log
+            if grep -q "Signature verified" install.log; then
+              echo "must not claim the signature was verified" >&2
+              exit 1
+            fi
+          fi
+          grep -q "Checksum verified" install.log
+          "$HOME/.local/bin/hey" --version
+
+  installer-ps1:
+    name: install.ps1 cosign ${{ matrix.cosign }}
+    needs: [has-release]
+    if: needs.has-release.outputs.exists == 'true'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # sha256 values come from each cosign release's cosign_checksums.txt.
+        include:
+          - cosign: v3.0.5
+            sha256: 44e9e44202b67ddfaaf5ea1234f5a265417960c4ae98c5b57c35bc40ba9dd714
+            expect: verified
+          - cosign: v2.6.0
+            sha256: 7beb4dd1e19a72c328bbf7c0d7342d744edbf5cbb082f227b2b76e04a21c16ef
+            expect: verified
+          - cosign: v2.4.0
+            sha256: 88f1addbae6bdd83ec2c067470c1f56b6d0d3ba35f49ad34603f2502cb2933f3
+            expect: skipped
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install cosign ${{ matrix.cosign }} (digest-pinned)
+        run: |
+          $binDir = Join-Path $env:RUNNER_TEMP 'cosign-bin'
+          New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+          $exe = Join-Path $binDir 'cosign.exe'
+          Invoke-WebRequest -UseBasicParsing `
+            -Uri "https://github.com/sigstore/cosign/releases/download/${{ matrix.cosign }}/cosign-windows-amd64.exe" `
+            -OutFile $exe
+          $actual = (Get-FileHash -Algorithm SHA256 -Path $exe).Hash.ToLowerInvariant()
+          if ($actual -ne '${{ matrix.sha256 }}') { throw "cosign digest mismatch: $actual" }
+          Add-Content $env:GITHUB_PATH $binDir
+
+      - name: Wait for release assets
+        if: env.RELEASE_TAG != ''
+        run: |
+          $tag = 'v' + ($env:RELEASE_TAG -replace '^v', '')
+          $url = "https://github.com/basecamp/hey-cli/releases/download/$tag/checksums.txt.bundle"
+          foreach ($i in 1..30) {
+            try {
+              Invoke-WebRequest -UseBasicParsing -Method Head -Uri $url | Out-Null
+              exit 0
+            } catch { Start-Sleep -Seconds 20 }
+          }
+          throw "$url never appeared"
+
+      - name: Run install.ps1 against the release
+        env:
+          HEY_NO_KEYRING: "1"
+        run: |
+          cosign version
+          $env:HEY_VERSION = $env:RELEASE_TAG -replace '^v', ''
+          & .\scripts\install.ps1 *>&1 | Tee-Object -FilePath install.log
+
+      - name: Assert the signature verification path
+        run: |
+          $log = Get-Content install.log -Raw
+          if ('${{ matrix.expect }}' -eq 'verified') {
+            if ($log -notmatch 'Signature verified') { throw 'expected cosign signature verification' }
+          } else {
+            if ($log -notmatch "Skipping signature verification") { throw 'expected the skip warning' }
+            if ($log -match 'Signature verified') { throw 'must not claim the signature was verified' }
+          }
+          if ($log -notmatch 'Checksum verified') { throw 'expected checksum verification' }
+          & "$env:USERPROFILE\bin\hey.exe" --version
