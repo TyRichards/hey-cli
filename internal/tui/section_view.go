@@ -13,6 +13,7 @@ type attachmentSaveFunc func(context.Context, string, string, bool) (int64, erro
 type attachmentOpenFunc func(string) error
 
 type viewContext struct {
+	rootSDK              *hey.Client
 	sdk                  *hey.Client
 	ctx                  context.Context
 	styles               styles
@@ -69,6 +70,10 @@ type sectionView interface {
 // instead of treating any of them as global shortcuts.
 type inputCapturer interface {
 	CapturingInput() bool
+}
+
+type accountSwitchBlocker interface {
+	AccountSwitchBlocked() bool
 }
 
 // pendingDetailCanceler is implemented by section views whose detail reads can

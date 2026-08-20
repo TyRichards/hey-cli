@@ -3,9 +3,11 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/basecamp/hey-cli/internal/apierr"
@@ -15,6 +17,7 @@ const (
 	configDirName = "hey-cli"
 	configFile    = "config.json"
 	defaultBase   = "https://app.hey.com"
+	AllAccounts   = "all"
 )
 
 type Source string
@@ -33,9 +36,20 @@ type Value struct {
 }
 
 type Config struct {
-	BaseURL string `json:"base_url"`
+	BaseURL   string `json:"base_url"`
+	AccountID string `json:"account_id,omitempty"`
 
-	sources map[string]Source
+	sources             map[string]Source
+	globalConfig        fileConfig
+	localConfig         *LocalConfig
+	trustedLocalConfigs map[string]trustedLocalConfigRecord
+}
+
+type fileConfig struct {
+	BaseURL             string                              `json:"base_url,omitempty"`
+	AccountID           string                              `json:"account_id,omitempty"`
+	AccountDefaults     map[string]string                   `json:"account_defaults,omitempty"`
+	TrustedLocalConfigs map[string]trustedLocalConfigRecord `json:"trusted_local_configs,omitempty"`
 }
 
 // OldConfig represents the legacy config format with embedded credentials.
@@ -114,62 +128,136 @@ func localConfigPath() string {
 
 func Load() (*Config, error) {
 	cfg := &Config{
-		BaseURL: defaultBase,
-		sources: map[string]Source{"base_url": SourceDefault},
+		BaseURL:   defaultBase,
+		AccountID: AllAccounts,
+		sources: map[string]Source{
+			"base_url":   SourceDefault,
+			"account_id": SourceDefault,
+		},
 	}
 
-	// Layer 1: global config
-	if err := cfg.loadFile(globalConfigPath(), SourceGlobal); err != nil {
+	global, err := readFileConfig(globalConfigPath())
+	if err != nil {
 		return nil, err
 	}
+	cfg.globalConfig = global
+	if global.BaseURL != "" {
+		cfg.BaseURL = global.BaseURL
+		cfg.sources["base_url"] = SourceGlobal
+	}
 
-	// Layer 2: local config (.hey/config.json walking up)
-	if local := localConfigPath(); local != "" {
-		if err := cfg.loadFile(local, SourceLocal); err != nil {
+	var local fileConfig
+	localPath := localConfigPath()
+	if localPath != "" {
+		local, err = readFileConfig(localPath)
+		if err != nil {
 			return nil, err
+		}
+		if local.BaseURL != "" {
+			cfg.BaseURL = local.BaseURL
+			cfg.sources["base_url"] = SourceLocal
+		}
+		if local.AccountID != "" {
+			cfg.AccountID = local.AccountID
+			cfg.sources["account_id"] = SourceLocal
 		}
 	}
 
-	// Layer 3: environment variables
 	if env := os.Getenv("HEY_BASE_URL"); env != "" {
 		cfg.BaseURL = env
 		cfg.sources["base_url"] = SourceEnv
 	}
+	if env := os.Getenv("HEY_ACCOUNT_ID"); env != "" {
+		accountID, accountErr := normalizeAccountID(env)
+		if accountErr != nil {
+			return nil, accountErr
+		}
+		cfg.AccountID = accountID
+		cfg.sources["account_id"] = SourceEnv
+	}
 
-	// Validate base URL
-	if err := validateBaseURL(cfg.BaseURL); err != nil {
-		return nil, err
+	if validationErr := validateBaseURL(cfg.BaseURL); validationErr != nil {
+		return nil, validationErr
+	}
+	if cfg.SourceOf("account_id") == SourceDefault {
+		if accountID, ok := accountDefaultFor(global, cfg.BaseURL); ok {
+			cfg.AccountID = accountID
+			cfg.sources["account_id"] = SourceGlobal
+		}
+	}
+	cfg.trustedLocalConfigs = global.TrustedLocalConfigs
+	if localPath != "" {
+		cfg.localConfig, err = makeLocalConfig(localPath, local, cfg.BaseURL, global.TrustedLocalConfigs)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return cfg, nil
 }
 
-func (c *Config) loadFile(path string, source Source) error {
+func readFileConfig(path string) (fileConfig, error) {
 	if path == "" {
-		return nil
+		return fileConfig{}, nil
 	}
-
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return fileConfig{}, nil
 		}
-		return fmt.Errorf("could not read config %s: %w", path, err)
+		return fileConfig{}, fmt.Errorf("could not read config %s: %w", path, err)
 	}
+	var file fileConfig
+	if unmarshalErr := json.Unmarshal(data, &file); unmarshalErr != nil {
+		return fileConfig{}, fmt.Errorf("could not parse config %s: %w", path, unmarshalErr)
+	}
+	if file.AccountID != "" {
+		file.AccountID, err = normalizeAccountID(file.AccountID)
+		if err != nil {
+			return fileConfig{}, fmt.Errorf("could not parse config %s: %w", path, err)
+		}
+	}
+	if len(file.AccountDefaults) > 0 {
+		normalizedDefaults := make(map[string]string, len(file.AccountDefaults))
+		for origin, accountID := range file.AccountDefaults {
+			normalizedOrigin, originErr := serverOrigin(origin)
+			if originErr != nil {
+				return fileConfig{}, fmt.Errorf("could not parse account default origin %s in %s: %w", origin, path, originErr)
+			}
+			normalized, normalizeErr := normalizeAccountID(accountID)
+			if normalizeErr != nil {
+				return fileConfig{}, fmt.Errorf("could not parse account default for %s in %s: %w", origin, path, normalizeErr)
+			}
+			if existing, duplicate := normalizedDefaults[normalizedOrigin]; duplicate && existing != normalized {
+				return fileConfig{}, fmt.Errorf("conflicting account defaults for %s in %s", normalizedOrigin, path)
+			}
+			normalizedDefaults[normalizedOrigin] = normalized
+		}
+		file.AccountDefaults = normalizedDefaults
+	}
+	return file, nil
+}
 
-	var file struct {
-		BaseURL string `json:"base_url"`
+func accountDefaultFor(file fileConfig, baseURL string) (string, bool) {
+	origin, err := serverOrigin(baseURL)
+	if err != nil {
+		return "", false
 	}
-	if err := json.Unmarshal(data, &file); err != nil {
-		return fmt.Errorf("could not parse config %s: %w", path, err)
+	if accountID, ok := file.AccountDefaults[origin]; ok {
+		return accountID, true
 	}
+	legacyOrigin, err := serverOrigin(firstNonEmpty(file.BaseURL, defaultBase))
+	if err == nil && legacyOrigin == origin && file.AccountID != "" {
+		return file.AccountID, true
+	}
+	return "", false
+}
 
-	if file.BaseURL != "" {
-		c.BaseURL = file.BaseURL
-		c.sources["base_url"] = source
+func firstNonEmpty(value, fallback string) string {
+	if value != "" {
+		return value
 	}
-
-	return nil
+	return fallback
 }
 
 func (c *Config) SourceOf(key string) Source {
@@ -189,11 +277,31 @@ func (c *Config) SetFromFlag(key, value string) error {
 		if err := validateBaseURL(value); err != nil {
 			return err
 		}
+		accountSource := c.SourceOf("account_id")
 		c.BaseURL = value
 		if c.sources == nil {
 			c.sources = map[string]Source{}
 		}
 		c.sources["base_url"] = SourceFlag
+		if accountSource == SourceDefault || accountSource == SourceGlobal {
+			c.AccountID = AllAccounts
+			c.sources["account_id"] = SourceDefault
+			if accountID, ok := accountDefaultFor(c.globalConfig, value); ok {
+				c.AccountID = accountID
+				c.sources["account_id"] = SourceGlobal
+			}
+		}
+		c.refreshLocalConfigTrust()
+	case "account_id":
+		accountID, err := normalizeAccountID(value)
+		if err != nil {
+			return err
+		}
+		c.AccountID = accountID
+		if c.sources == nil {
+			c.sources = map[string]Source{}
+		}
+		c.sources["account_id"] = SourceFlag
 	}
 	return nil
 }
@@ -201,6 +309,7 @@ func (c *Config) SetFromFlag(key, value string) error {
 func (c *Config) Values() []Value {
 	return []Value{
 		{Value: c.BaseURL, Source: c.SourceOf("base_url")},
+		{Value: c.AccountID, Source: c.SourceOf("account_id")},
 	}
 }
 
@@ -221,22 +330,137 @@ func LoadOld() (*OldConfig, error) {
 	return &cfg, nil
 }
 
-func (c *Config) Save() error {
-	path := globalConfigPath()
+// SaveBaseURL stores the global server URL while preserving account defaults for every server.
+func (c *Config) SaveBaseURL(baseURL string) error {
+	file, err := loadGlobalFileConfig()
+	if err != nil {
+		return err
+	}
+	if err := migrateLegacyAccountDefault(&file); err != nil {
+		return err
+	}
+	file.BaseURL = baseURL
+	return saveGlobalConfig(file)
+}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return fmt.Errorf("could not create config directory: %w", err)
+// SaveAccountID stores the default linked-account filter for the effective server
+// without replacing settings for any other server.
+func (c *Config) SaveAccountID(accountID string) error {
+	accountID, err := normalizeAccountID(accountID)
+	if err != nil {
+		return err
+	}
+	origin, err := serverOrigin(c.BaseURL)
+	if err != nil {
+		return err
 	}
 
-	data, err := json.MarshalIndent(c, "", "  ")
+	file, err := loadGlobalFileConfig()
+	if err != nil {
+		return err
+	}
+	if err := migrateLegacyAccountDefault(&file); err != nil {
+		return err
+	}
+	if file.AccountDefaults == nil {
+		file.AccountDefaults = make(map[string]string)
+	}
+	file.AccountDefaults[origin] = accountID
+	return saveGlobalConfig(file)
+}
+
+func loadGlobalFileConfig() (fileConfig, error) {
+	return readFileConfig(globalConfigPath())
+}
+
+func migrateLegacyAccountDefault(file *fileConfig) error {
+	if file.AccountID == "" {
+		return nil
+	}
+	origin, err := serverOrigin(firstNonEmpty(file.BaseURL, defaultBase))
+	if err != nil {
+		return err
+	}
+	if file.AccountDefaults == nil {
+		file.AccountDefaults = make(map[string]string)
+	}
+	if _, exists := file.AccountDefaults[origin]; !exists {
+		file.AccountDefaults[origin] = file.AccountID
+	}
+	file.AccountID = ""
+	return nil
+}
+
+func saveGlobalConfig(file fileConfig) error {
+	path := globalConfigPath()
+	if path == "" {
+		return fmt.Errorf("could not determine config path")
+	}
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return fmt.Errorf("could not create config directory: %w", err)
+	}
+	if err := os.Chmod(directory, 0700); err != nil {
+		return fmt.Errorf("could not secure config directory: %w", err)
+	}
+
+	data, err := json.MarshalIndent(file, "", "  ")
 	if err != nil {
 		return fmt.Errorf("could not marshal config: %w", err)
 	}
-
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		return fmt.Errorf("could not write config: %w", err)
+	temporary, err := os.CreateTemp(directory, ".config-*")
+	if err != nil {
+		return fmt.Errorf("could not create temporary config: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if err := temporary.Chmod(0600); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("could not secure temporary config: %w", err)
+	}
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("could not write temporary config: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("could not close temporary config: %w", err)
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("could not replace config: %w", err)
 	}
 	return nil
+}
+
+func normalizeAccountID(accountID string) (string, error) {
+	accountID = strings.TrimSpace(accountID)
+	if strings.EqualFold(accountID, AllAccounts) {
+		return AllAccounts, nil
+	}
+	id, err := strconv.ParseInt(accountID, 10, 64)
+	if err != nil || id <= 0 {
+		return "", apierr.ErrUsage(fmt.Sprintf("account must be a positive ID or %q (got %q)", AllAccounts, accountID))
+	}
+	return strconv.FormatInt(id, 10), nil
+}
+
+func serverOrigin(base string) (string, error) {
+	u, err := url.Parse(base)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", apierr.ErrUsage(fmt.Sprintf("invalid base URL %q", base))
+	}
+	scheme := strings.ToLower(u.Scheme)
+	hostname := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		port = ""
+	}
+	host := hostname
+	if port != "" {
+		host = net.JoinHostPort(hostname, port)
+	} else if strings.Contains(hostname, ":") {
+		host = "[" + hostname + "]"
+	}
+	return (&url.URL{Scheme: scheme, Host: host}).String(), nil
 }
 
 func validateBaseURL(base string) error {

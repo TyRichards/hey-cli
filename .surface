@@ -1,4 +1,5 @@
 hey
+hey --account
 hey --agent
 hey --base-url
 hey --count
@@ -10,6 +11,9 @@ hey --quiet
 hey --stats
 hey --styled
 hey --verbose
+hey accounts
+hey accounts list
+hey accounts use
 hey attachments
 hey attachments save
 hey attachments save --force
@@ -50,6 +54,9 @@ hey compose --to
 hey config
 hey config set
 hey config show
+hey config trust-local
+hey config trusted-locals
+hey config untrust-local
 hey contacts
 hey contacts add
 hey contacts add --account-user-id

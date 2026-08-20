@@ -54,9 +54,41 @@ hey auth refresh  # force token refresh
 hey auth logout   # clear credentials
 ```
 
+### Linked accounts
+
+One HEY login exposes every mail account linked to that identity. List the available
+filters, persist a default, or select one for a single invocation:
+
+```bash
+hey accounts list                 # list All Accounts and each linked account
+hey accounts use 12345            # persist a linked account as the default mail filter
+hey accounts use all              # return to All Accounts
+hey --account 12345 boxes         # override the default for one invocation
+HEY_ACCOUNT_ID=12345 hey search "quarterly planning"
+```
+
+The default is `all`. Selection precedence is `--account`, `HEY_ACCOUNT_ID`, trusted local
+`.hey/config.json`, the global default for the active server, then All Accounts. Global
+account defaults are stored separately for each server origin, so development and production
+selections cannot affect one another. Explicit and persisted IDs are validated against the
+signed-in identity before mail requests, so an unavailable account fails closed.
+
+The first command that would use a repository-local server or account setting asks whether to
+use it once, always trust its current values, or cancel. Non-interactive and JSON commands fail
+closed until you explicitly run `hey config trust-local` from that directory. Changes to the
+local server or account invalidate trust. Review trust with `hey config trusted-locals` and
+remove it with `hey config untrust-local`.
+
+Compose and contact creation use an individually selected account; replies and forwards use
+the thread's account. Calendars, todos, habits, time tracking, and journal entries remain
+identity-wide.
+
 ## TUI
 
-Run `hey` to launch the interactive terminal UI.
+Run `hey` to launch the interactive terminal UI. For identities with multiple linked mail
+accounts, press Ctrl+A to switch between All Accounts and individual email addresses.
+Switching cancels requests from the previous account and reloads the active section;
+Calendar and Journal remain identity-wide.
 
 Navigate between Mail, Contacts, Calendar, and Journal. In Mail, use `/` to search, Enter to open a thread, `r` to reply, `f` to forward, `m` to move, `t` to trash, `s` to mark as spam, `-` to ignore, and `+` to stop ignoring. Select threads with Space and press `b` to preview every bulk-reply recipient before writing and sending one reply to all selected threads. A delayed bulk reply can be recalled with `u` while HEY's undo window remains open. Search results retain the matching-message summary; use `n` and `p` to move between result pages.
 
@@ -66,7 +98,8 @@ Press Shift+O to open Contacts. Use Enter to view a contact, `a` to add, `e` to 
 
 ## CLI Commands
 
-All commands support `--json` for raw JSON output and `--base-url` to override the server URL.
+All commands support `--json` for raw JSON output, `--base-url` to override the server URL,
+and `--account <id|all>` to select a linked mail account.
 
 ### Email
 
