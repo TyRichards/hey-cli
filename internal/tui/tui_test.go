@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -8,6 +9,8 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+
+	hey "github.com/basecamp/hey-sdk/go/pkg/hey"
 
 	"github.com/basecamp/hey-cli/internal/models"
 )
@@ -162,6 +165,80 @@ func TestOrderBoxes(t *testing.T) {
 }
 
 // --- Navigation: Tab cycles focus rows ---
+
+func TestOrderBoxesPreservesFolderWithCollidingIDAndName(t *testing.T) {
+	boxes := []models.Box{
+		{ID: 1, Kind: hey.BoxKindImbox, Name: "Imbox"},
+		{ID: 1, Kind: mailSourceKindFolder, Name: "Imbox"},
+	}
+	ordered := orderBoxes(boxes)
+	if len(ordered) != 2 || ordered[0].Kind != hey.BoxKindImbox || ordered[1].Kind != mailSourceKindFolder {
+		t.Errorf("ordered sources = %+v", ordered)
+	}
+	if index := boxForShortcut("I", ordered); index != 0 {
+		t.Errorf("Imbox shortcut index = %d, want box index 0", index)
+	}
+	items := boxNavItems(ordered)
+	if items[0].icon == "" || items[1].icon != "" {
+		t.Errorf("navigation icons = %+v", items)
+	}
+}
+
+func TestFolderDiscoveryCompletesWhileAnotherSectionIsActive(t *testing.T) {
+	m := newModel()
+	m.section = sectionCalendar
+	m.activeView = m.calendarView
+	m.mailView.sourceRequestID = 1
+
+	updated, cmd := m.Update(mailSourcesLoadedMsg{
+		requestID: 1,
+		sources: []models.Box{
+			{ID: 1, Kind: hey.BoxKindImbox, Name: "Imbox"},
+			{ID: 12, Kind: mailSourceKindFolder, Name: "Receipts"},
+		},
+	})
+	m = updated.(model)
+	if len(m.mailView.boxes) != 2 || m.mailView.boxes[1].Name != "Receipts" {
+		t.Errorf("mail sources = %+v", m.mailView.boxes)
+	}
+	if cmd == nil {
+		t.Error("inactive Mail view should continue loading its selected source")
+	}
+}
+
+func TestInactiveMailIgnoresStalePostingErrors(t *testing.T) {
+	m := newModel()
+	m.section = sectionCalendar
+	m.activeView = m.calendarView
+	m.mailView.boxes = []models.Box{{ID: 1, Kind: hey.BoxKindImbox, Name: "Imbox"}}
+	m.mailView.boxIndex = 0
+	m.mailView.activeRequestID = 2
+	m.mailView.activeRequestKind = mailRequestPostings
+	m.mailView.loading = true
+	m.mailView.notice = "Current mail state"
+
+	updated, cmd := m.Update(postingsLoadedMsg{
+		requestID:  1,
+		boxID:      1,
+		sourceKind: hey.BoxKindImbox,
+		err:        fmt.Errorf("stale failure"),
+	})
+	m = updated.(model)
+	if cmd != nil || m.mailView.notice != "Current mail state" || !m.mailView.loading || m.mailView.activeRequestID != 2 {
+		t.Errorf("stale error changed inactive Mail: notice=%q loading=%v request=%d", m.mailView.notice, m.mailView.loading, m.mailView.activeRequestID)
+	}
+
+	updated, cmd = m.Update(postingsLoadedMsg{
+		requestID:  2,
+		boxID:      1,
+		sourceKind: hey.BoxKindImbox,
+		err:        fmt.Errorf("current failure"),
+	})
+	m = updated.(model)
+	if cmd != nil || m.mailView.notice != "Could not load mail: current failure" || m.mailView.loading {
+		t.Errorf("current error state = notice:%q loading:%v", m.mailView.notice, m.mailView.loading)
+	}
+}
 
 func TestTabCyclesFocus(t *testing.T) {
 	m := modelWithBoxes()

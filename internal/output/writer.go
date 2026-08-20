@@ -299,7 +299,7 @@ func (w *Writer) writeMarkdown(data any) error {
 		}
 		keys := sortedKeys(m)
 		for _, k := range keys {
-			fmt.Fprintf(w.opts.Stdout, "**%s:** %v\n", k, m[k])
+			fmt.Fprintf(w.opts.Stdout, "**%s:** %s\n", markdownCell(k), markdownCell(fmt.Sprintf("%v", m[k])))
 		}
 		return nil
 	}
@@ -326,7 +326,7 @@ func (w *Writer) writeMarkdown(data any) error {
 	sb.WriteString("|")
 	for _, h := range headers {
 		sb.WriteString(" ")
-		sb.WriteString(h)
+		sb.WriteString(markdownCell(h))
 		sb.WriteString(" |")
 	}
 	sb.WriteString("\n|")
@@ -347,7 +347,7 @@ func (w *Writer) writeMarkdown(data any) error {
 				}
 			}
 			sb.WriteString(" ")
-			sb.WriteString(v)
+			sb.WriteString(markdownCell(v))
 			sb.WriteString(" |")
 		}
 		sb.WriteString("\n")
@@ -355,6 +355,35 @@ func (w *Writer) writeMarkdown(data any) error {
 
 	fmt.Fprint(w.opts.Stdout, sb.String())
 	return nil
+}
+
+func markdownCell(value string) string {
+	value = sanitizeTerminal(value)
+	value = escapeMarkdownTablePipes(value)
+	value = strings.ReplaceAll(value, "\t", " ")
+	return strings.ReplaceAll(value, "\n", "<br>")
+}
+
+func escapeMarkdownTablePipes(value string) string {
+	var escaped strings.Builder
+	for index := 0; index < len(value); {
+		start := index
+		for index < len(value) && value[index] == '\\' {
+			index++
+		}
+		if index < len(value) && value[index] == '|' {
+			escaped.WriteString(strings.Repeat(`\`, 2*(index-start)+1))
+			escaped.WriteByte('|')
+			index++
+			continue
+		}
+		escaped.WriteString(value[start:index])
+		if index < len(value) {
+			escaped.WriteByte(value[index])
+			index++
+		}
+	}
+	return escaped.String()
 }
 
 func isTTY(w io.Writer) bool {
