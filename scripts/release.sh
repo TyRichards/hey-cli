@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Usage: scripts/release.sh VERSION [--dry-run]
-#   VERSION: semver with v prefix (e.g. v1.0.0)
+#   VERSION: semver, with or without the v prefix (0.2.0, v0.2.0, 0.2.0-rc.1)
 #
-# Validates, tags, and pushes to trigger the release workflow.
+# Validates, updates stable release metadata, tags, and pushes to trigger the
+# release workflow. Set DRY_RUN=1 (or pass --dry-run) to run the checks only.
 
 set -euo pipefail
 
@@ -24,110 +25,246 @@ DRY_RUN="${DRY_RUN:-0}"
 if [[ "$*" == *"--dry-run"* ]]; then
   DRY_RUN=1
 fi
+case "$DRY_RUN" in
+  1|true) DRY_RUN=1 ;;
+  *) DRY_RUN=0 ;;
+esac
 
-if [ -z "$VERSION" ]; then
+if [[ -z "$VERSION" || "$VERSION" == "dev" ]]; then
   echo "Usage: scripts/release.sh VERSION [--dry-run]"
-  echo "       VERSION=v1.0.0 make release"
+  echo "       make release VERSION=0.2.0 [DRY_RUN=1]"
   exit 1
 fi
 
-# Validate semver
-if ! echo "$VERSION" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
-  die "Invalid version '$VERSION' (expected vX.Y.Z or vX.Y.Z-suffix)"
+# --- Normalise and validate the version ---
+VERSION="${VERSION#v}"
+# Leading zeros are refused (semver forbids them, and bash arithmetic would
+# read 08 as broken octal in the version comparison below).
+if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[a-zA-Z0-9.]+)?$ ]]; then
+  die "Invalid version '${VERSION}' (expected X.Y.Z or X.Y.Z-suffix without leading zeros, optionally v-prefixed)"
 fi
 
-if [[ "$DRY_RUN" == "1" || "$DRY_RUN" == "true" ]]; then
-  info "Dry run — no tags will be created or pushed"
+TAG="v${VERSION}"
+PRERELEASE=0
+if [[ "$VERSION" == *-* ]]; then
+  PRERELEASE=1
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  info "Dry run — no commits, tags or pushes"
   echo ""
 fi
 
-# nix/package.nix carries its own version literal: it is what `nix profile
-# install github:basecamp/hey-cli` builds and what that binary's --version
-# reports. Tagging without it means the flake keeps advertising the previous
-# release, and nix-verify cannot tell — it only proves the flake builds. The
-# update is deliberate rather than automatic because it rebuilds the flake
-# via Docker and produces a commit to review; this gate makes skipping it
-# impossible. Prereleases are exempt: the flake tracks stable releases only.
-if [[ "$VERSION" != *-* ]]; then
-  NIX_VERSION=$(sed -n 's/.*version = "\([^"]*\)".*/\1/p' nix/package.nix | head -1)
-  if [[ "$NIX_VERSION" != "${VERSION#v}" ]]; then
-    die "nix/package.nix is at ${NIX_VERSION}, not ${VERSION#v}. Run \`make update-nix-hash VERSION=${VERSION}\`, then commit and push before releasing."
-  fi
-fi
-
-# Detect default branch
+# --- Verify branch ---
 DEFAULT_BRANCH=$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p')
 DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
-
-# Verify on default branch
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-if [ "$CURRENT_BRANCH" != "$DEFAULT_BRANCH" ]; then
-  die "Not on $DEFAULT_BRANCH (currently on $CURRENT_BRANCH)"
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+if [[ "$BRANCH" != "$DEFAULT_BRANCH" ]]; then
+  die "Not on $DEFAULT_BRANCH (currently on $BRANCH)"
 fi
 
-# Clean working tree
-if [ -n "$(git status --porcelain)" ]; then
-  die "Working tree is not clean"
+# --- Verify clean tree ---
+if [[ -n "$(git status --porcelain)" ]]; then
+  die "Working tree is not clean. Commit or stash changes first."
 fi
 
-# Synced with remote
+# From here on the tree is known clean, so on failure the stable metadata
+# files can be checked out to undo any half-made edits — a failed nix update
+# or plugin stamp must not leave a dirty tree that blocks the next attempt.
+# Checkout from HEAD, not the index: a failed release commit (hook, signing)
+# leaves the files staged, and a plain `git checkout --` would restore the
+# staged copies and leave the index dirty. Once the release prep commit
+# lands, HEAD contains the new metadata and the checkout is a no-op.
+restore_release_metadata() {
+  if [[ "${1:-1}" -ne 0 ]]; then
+    git checkout --quiet HEAD -- nix/package.nix .claude-plugin/plugin.json || true
+  fi
+}
+trap 'restore_release_metadata "$?"' EXIT
+
+# --- Verify synced with remote ---
 git fetch origin "$DEFAULT_BRANCH" --quiet
 LOCAL=$(git rev-parse HEAD)
 REMOTE=$(git rev-parse "origin/$DEFAULT_BRANCH")
-if [ "$LOCAL" != "$REMOTE" ]; then
+if [[ "$LOCAL" != "$REMOTE" ]]; then
   die "Local $DEFAULT_BRANCH (${LOCAL:0:7}) is not synced with origin (${REMOTE:0:7}). Pull or push first."
 fi
 
-# No replace directives
-if grep -q '^replace' go.mod; then
+# --- Verify no replace directives ---
+if grep -q '^[[:space:]]*replace[[:space:]]' go.mod; then
   die "go.mod contains replace directives. Remove them before releasing."
 fi
 
-# Verify required tools
+# --- Verify required tools ---
 if ! command -v jq >/dev/null 2>&1; then
   die "jq is required but not found. Install with your package manager."
 fi
 
+# --- Validate the tag before anything mutates ---
+# Everything below this point that touches main (the stable metadata commit)
+# happens before the tag is created, so a release that is going to be refused
+# must be refused here, while main is still untouched.
+git fetch origin --tags --quiet
+if git rev-parse -q --verify "refs/tags/${TAG}^{commit}" >/dev/null; then
+  EXISTING_SHA=$(git rev-parse "refs/tags/${TAG}^{commit}")
+  if [[ "$EXISTING_SHA" != "$LOCAL" ]]; then
+    # Never suggest moving a tag: proxy.golang.org caches tags as it first saw
+    # them, so a moved tag is at best ignored and at worst a checksum mismatch
+    # for everyone who fetched the original.
+    die "Tag $TAG already exists at ${EXISTING_SHA:0:7} (not HEAD). Published tags are cached by the Go module proxy and must not move — choose a new version."
+  fi
+  # Tag at HEAD: only re-runnable if HEAD already carries the stable metadata.
+  # A hand-pushed tag at an unstamped commit must be refused HERE, before the
+  # metadata commit moves main out from under the tag — otherwise the script
+  # mutates main, then discovers the mismatch and the operator is stuck with a
+  # proxy-cached tag that cannot be reused.
+  if [[ "$PRERELEASE" -eq 0 ]]; then
+    STAMPED_NIX=$(sed -n 's/.*version = "\([^"]*\)".*/\1/p' nix/package.nix | head -1)
+    STAMPED_PLUGIN=$(jq -r .version .claude-plugin/plugin.json)
+    if [[ "$STAMPED_NIX" != "$VERSION" || "$STAMPED_PLUGIN" != "$VERSION" ]]; then
+      die "Tag $TAG already exists at HEAD, but HEAD's release metadata is not stamped for it (nix ${STAMPED_NIX}, plugin ${STAMPED_PLUGIN}). The tag may already be cached by the Go module proxy — choose a new version."
+    fi
+  fi
+fi
+
+# A stable version below the latest stable tag would roll the Nix flake and
+# plugin metadata on main backwards, and sync-skills would mirror the older
+# tree. Compare numerically, never lexically — and never with sort -V, which
+# macOS's stock sort does not provide (same reasoning as check-lint-lockstep.sh).
+# Git's version:refname ordering picks the latest stable tag, and a field
+# compare orders it against the new version; both sides are stable X.Y.Z here.
+# Force base 10: the requested version is validated against leading zeros
+# above, but an already-pushed tag like v1.09.0 is not, and bash would
+# otherwise read its fields as octal and error the comparison into a no.
+version_lt() {
+  local -a a b
+  local i
+  IFS=. read -r -a a <<< "${1#v}"
+  IFS=. read -r -a b <<< "${2#v}"
+  for i in 0 1 2; do
+    if (( 10#${a[i]:-0} < 10#${b[i]:-0} )); then return 0; fi
+    if (( 10#${a[i]:-0} > 10#${b[i]:-0} )); then return 1; fi
+  done
+  return 1
+}
+
+if [[ "$PRERELEASE" -eq 0 ]]; then
+  LATEST_STABLE=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | awk '!/-/ { print; exit }')
+  if [[ -n "$LATEST_STABLE" && "$LATEST_STABLE" != "$TAG" ]] && version_lt "$TAG" "$LATEST_STABLE"; then
+    die "Version $VERSION is older than the latest stable release ${LATEST_STABLE#v}. Stable releases cannot go backwards."
+  fi
+fi
+
 # --- Run pre-flight checks ---
 info "Running release checks"
-info "  Branch: $CURRENT_BRANCH"
+info "  Branch: $BRANCH"
 info "  Commit: ${LOCAL:0:7}"
+info "  Tag:    $TAG"
+echo ""
+make release-check
 
-if [[ "$DRY_RUN" == "1" || "$DRY_RUN" == "true" ]]; then
-  echo ""
-  info "Running release-check..."
-  make release-check
+# --- Update stable release metadata ---
+# Prereleases leave the Nix flake and plugin metadata on the latest stable
+# version: those channels only ever point at stable.
+if [[ "$PRERELEASE" -eq 1 ]]; then
+  info "Skipping stable release metadata for prerelease"
+  echo "  nix flake: unchanged"
+  echo "  Claude plugin metadata: unchanged"
+else
+  info "Updating Nix flake"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "  (skipped — dry run)"
+  else
+    NIX_RC=0
+    scripts/update-nix-flake.sh "$VERSION" || NIX_RC=$?
+    if [[ "$NIX_RC" -eq 0 ]]; then
+      : # nix flake updated
+    elif [[ "$NIX_RC" -eq 2 ]]; then
+      echo "  nix flake: no changes needed"
+    else
+      die "scripts/update-nix-flake.sh failed (exit $NIX_RC)"
+    fi
+  fi
+
+  info "Stamping plugin version"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "  (skipped — dry run)"
+  else
+    scripts/stamp-plugin-version.sh "$VERSION"
+  fi
+fi
+
+# --- Commit release prep ---
+# Committed here, pushed below together with the tag. The tag was validated
+# against origin before anything mutated, but that check has a window: another
+# operator can push the same tag (or move main) while release-check runs.
+# Pushing main on its own and discovering the tag collision afterwards would
+# leave main stamped for a tag that points elsewhere and cannot be moved, so
+# the two refs go up in one --atomic push — an existing remote tag or a
+# non-fast-forward main rejects both, and origin is left exactly as found.
+PREP_BASE="$LOCAL"
+if [[ "$PRERELEASE" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
+  git add nix/package.nix .claude-plugin/plugin.json
+  if ! git diff --cached --quiet; then
+    STAGED=$(git diff --cached --name-only)
+    HAS_NIX=0
+    HAS_PLUGIN=0
+    grep -q '^nix/package\.nix$' <<<"$STAGED" && HAS_NIX=1
+    grep -q '^\.claude-plugin/plugin\.json$' <<<"$STAGED" && HAS_PLUGIN=1
+    if [[ "$HAS_NIX" -eq 1 && "$HAS_PLUGIN" -eq 1 ]]; then
+      COMMIT_MSG="Update nix flake and plugin version for ${TAG}"
+    elif [[ "$HAS_NIX" -eq 1 ]]; then
+      COMMIT_MSG="Update nix flake for ${TAG}"
+    else
+      COMMIT_MSG="Update plugin version for ${TAG}"
+    fi
+    git commit -m "$COMMIT_MSG"
+    LOCAL=$(git rev-parse HEAD)
+    info "Committed release prep (${LOCAL:0:7})"
+  fi
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
   echo ""
   info "Dry run complete. No tag created."
   exit 0
 fi
 
-echo ""
-info "Running release-check..."
-make release-check
-
-# --- Fetch tags to ensure we see remote state ---
-git fetch origin --tags --quiet
-
 # --- Handle tag ---
-if git rev-parse "$VERSION" >/dev/null 2>&1; then
-  EXISTING_SHA=$(git rev-parse "${VERSION}^{commit}")
+# Validated above against the pre-release-prep HEAD; the only way it can still
+# disagree is a tag that already existed at an unstamped commit.
+if git rev-parse -q --verify "refs/tags/${TAG}^{commit}" >/dev/null; then
+  EXISTING_SHA=$(git rev-parse "refs/tags/${TAG}^{commit}")
   if [[ "$EXISTING_SHA" == "$LOCAL" ]]; then
-    info "Tag $VERSION already exists at HEAD"
+    info "Tag $TAG already exists at HEAD"
   else
-    die "Tag $VERSION already exists at ${EXISTING_SHA:0:7} (not HEAD). Delete it first or choose a different version."
+    die "Tag $TAG exists at ${EXISTING_SHA:0:7} but the release prep commit moved HEAD to ${LOCAL:0:7}. Delete the tag and re-run."
   fi
 else
-  echo ""
-  info "Creating tag $VERSION..."
-  git tag -a "$VERSION" -m "Release $VERSION"
+  info "Creating tag $TAG"
+  git tag -a "$TAG" -m "Release $TAG"
 fi
 
-info "Pushing $VERSION to origin..."
-git push origin "$VERSION"
+# On rejection, put the clone back where a re-run can start: drop the local
+# prep commit and tag so the next attempt (under a new version, if the tag was
+# taken) is not blocked by an unpushed main or a stale local tag.
+PUSH_REFS=("$TAG")
+if [[ "$LOCAL" != "$PREP_BASE" ]]; then
+  PUSH_REFS=("$DEFAULT_BRANCH" "$TAG")
+fi
+info "Pushing ${PUSH_REFS[*]} to origin"
+if ! git push --atomic origin "${PUSH_REFS[@]}"; then
+  git tag -d "$TAG" >/dev/null
+  git reset --quiet --hard "$PREP_BASE"
+  git fetch origin --tags --quiet
+  die "Push rejected: origin changed while the release was being prepared (another push of $TAG or $DEFAULT_BRANCH). Nothing was pushed; main and the tag were reset locally. Re-run after pulling — or choose a new version if $TAG is now taken."
+fi
+if [[ "$LOCAL" != "$PREP_BASE" ]]; then
+  info "Pushed release prep (${LOCAL:0:7})"
+fi
 
 echo ""
-info "Released $VERSION"
+info "Release $TAG triggered"
 echo ""
 echo "  Actions: https://github.com/basecamp/hey-cli/actions"
-echo "  Release: https://github.com/basecamp/hey-cli/releases/tag/$VERSION"
+echo "  Release: https://github.com/basecamp/hey-cli/releases/tag/$TAG"

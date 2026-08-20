@@ -1,80 +1,206 @@
 # Releasing hey-cli
 
-## Quick Release
+## Quick release
 
 ```bash
-# Run preflight checks and tag
-make release VERSION=v1.0.0
-
-# Or dry-run first
-make release VERSION=v1.0.0 DRY_RUN=1
+make release VERSION=0.2.0
 ```
 
-Pushing the tag triggers the GitHub Actions release workflow, which:
-1. Runs the full test suite
-2. Runs security scans (gitleaks, Trivy, gosec)
-3. Builds binaries for all platforms (linux/darwin/windows/freebsd/openbsd x amd64/arm64)
-4. Signs macOS binaries (Developer ID + notarization)
-5. Signs `checksums.txt` with cosign (keyless, OIDC) as `checksums.txt.bundle`
-6. Generates SBOMs with Syft
-7. Publishes Homebrew cask to `basecamp/homebrew-tap`
-8. Publishes Scoop manifest to `basecamp/homebrew-tap`
-9. Builds .deb, .rpm and .apk packages
-10. Publishes the binary package to AUR (if `AUR_KEY` configured; isolated and non-blocking — an AUR outage cannot fail the release)
-11. Checks CLI surface compatibility against previous release
-12. Syncs skills to `basecamp/skills`
+## Release candidate
+
+```bash
+make release VERSION=0.2.0-rc.1
+```
+
+## Dry run
+
+```bash
+make release VERSION=0.2.0 DRY_RUN=1
+```
+
+`VERSION` accepts `0.2.0` or `v0.2.0`; the tag is always `v0.2.0`.
+
+## What happens
+
+`scripts/release.sh`:
+
+1. Validates the version, that you are on the default branch with a clean tree
+   synced to origin, and that `go.mod` has no `replace` directives
+2. Runs `make release-check`
+3. For **stable** versions only: runs `scripts/update-nix-flake.sh` (verifies the
+   Nix build via Docker and recomputes `vendorHash` if needed) and
+   `scripts/stamp-plugin-version.sh`, commits `nix/package.nix` and
+   `.claude-plugin/plugin.json`, and pushes that commit to main
+4. Creates the annotated tag and pushes it
+
+Before touching anything it fetches tags and refuses a tag that already exists at
+another commit, or a stable version older than the latest stable tag, so a
+rejected release leaves main untouched. Pushing a stable tag by hand skips the
+metadata commit; GoReleaser then fails the release at its stable metadata check
+(`scripts/check-stable-metadata.sh`, covering the plugin stamp and the Nix
+package version) rather than publishing stale metadata.
+
+The [release workflow](.github/workflows/release.yml) then runs **against the tag
+SHA** (which is why the prep commit is pushed first):
+
+- `test`: lint lockstep, fmt, vet, lint, unit tests, bats suite, tidy, surface
+  snapshot, race detector, govulncheck, CLI surface compatibility vs the previous tag
+- `security`: gitleaks, Trivy, gosec
+- `release`: preflights the macOS signing secrets, verifies the tag is on main,
+  then GoReleaser checks that a stable tag carries the plugin stamp and the
+  Nix package version, builds
+  darwin/linux/windows/freebsd/openbsd × amd64/arm64 and deb/rpm/apk packages,
+  signs and notarizes macOS binaries, signs `checksums.txt` with cosign (keyless,
+  `checksums.txt.bundle`), generates SBOMs, publishes the GitHub release, and
+  updates the Homebrew cask and Scoop manifest; the checksums are then attested
+  with GitHub build provenance
+- After publication: `macos-verify`, `nix-verify` (stable only), `aur-publish`
+  (stable only, non-blocking), `sync-skills` (stable only, non-blocking)
+
+Windows binaries and `install.ps1` are **not** Authenticode-signed yet; see
+[Windows signing](#windows-signing).
+
+## Stable vs prerelease
+
+| Surface | Stable `0.2.0` | Prerelease `0.2.0-rc.1` |
+|---------|----------------|-------------------------|
+| GitHub Releases | Normal release, marked Latest | Marked prerelease; Latest stays on stable |
+| Release assets | Archives, checksums + bundle, SBOMs, deb/rpm/apk | Same |
+| Homebrew cask `hey` | Updated in `basecamp/homebrew-tap` | Unchanged |
+| Scoop `hey` | Updated in `basecamp/homebrew-tap` | Unchanged |
+| AUR `hey-cli` | Updated by `publish-aur.sh` | Unchanged |
+| Nix flake | `nix/package.nix` bumped and verified | Unchanged |
+| Claude plugin metadata | `.claude-plugin/plugin.json` stamped | Unchanged |
+| Skills distribution | Synced to `basecamp/skills` | Unchanged |
+| Release notes | Diffed against the previous **stable** tag | GoReleaser default |
 
 ## Versioning
 
-Follow [semver](https://semver.org/). Use `v` prefix for tags: `v1.0.0`, `v1.1.0-rc.1`.
+Pre-1.0: minor bumps for features, patch bumps for fixes. Use `-rc.N` when testers
+need a build before the next stable version.
 
-## CI Secrets
+`v0.1.0` exists as a draft with no assets: its release failed at the cosign step
+(cosign v3 removed the flags the config used) and `proxy.golang.org` had already
+cached the tag, so it could not be reused. The first working release is `v0.1.1`.
 
-| Secret | Purpose |
-|--------|---------|
-| `RELEASE_CLIENT_ID` (var) | GitHub App client ID for `cli-release-bot` |
-| `RELEASE_APP_PRIVATE_KEY` | GitHub App private key for tap + skills push |
-| `MACOS_SIGN_P12` | Base64-encoded Developer ID Application .p12 |
-| `MACOS_SIGN_PASSWORD` | Password for the .p12 certificate |
-| `MACOS_NOTARY_KEY` | Base64-encoded App Store Connect API key (.p8) |
-| `MACOS_NOTARY_KEY_ID` | App Store Connect API key ID (10 chars) |
-| `MACOS_NOTARY_ISSUER_ID` | App Store Connect issuer UUID |
-| `AUR_KEY` | ed25519 SSH private key for AUR (optional) |
+## Secrets and variables
 
-## Distribution Channels
+Everything lives on the **`release` environment** (Settings → Environments), not
+at repository scope. basecamp-cli's `scripts/manage-release-env.sh` audits and
+converges the environment across the CLI repos and copies secrets in from
+1Password; add new rows there rather than pasting by hand.
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `RELEASE_CLIENT_ID` | variable | GitHub App client ID for `cli-release-bot` (tap and skills pushes) |
+| `RELEASE_APP_PRIVATE_KEY` | secret | GitHub App private key |
+| `MACOS_SIGN_P12` | secret | Base64 Developer ID Application certificate (.p12) |
+| `MACOS_SIGN_PASSWORD` | secret | .p12 password |
+| `MACOS_NOTARY_KEY` | secret | Base64 App Store Connect API key (.p8) |
+| `MACOS_NOTARY_KEY_ID` | secret | App Store Connect key ID |
+| `MACOS_NOTARY_ISSUER_ID` | secret | App Store Connect issuer UUID |
+| `AUR_KEY` | secret | ed25519 SSH private key for the AUR (optional; publish skips without it) |
+
+The macOS preflight is gated on `github.repository == 'basecamp/hey-cli'`, so the
+canonical repo refuses to release unsigned. Forks cannot release at all: the
+GitHub App token step needs the `release` environment and GoReleaser publishes to
+`basecamp/hey-cli`.
+
+## Windows signing
+
+Not wired yet. `release.yml` has no Windows signing step and `.goreleaser.yaml`
+does not sign Windows artifacts, so the `hey.exe` binaries and `install.ps1` are
+published unsigned; `install.ps1` only consults the Authenticode status when
+diagnosing a first-run failure. The port from basecamp-cli (Authenticode via
+[jsign](https://ebourg.github.io/jsign/) against DigiCert KeyLocker, with
+`SM_API_KEY`, `SM_CLIENT_CERT_FILE_B64` and `SM_CLIENT_CERT_PASSWORD` on the
+`release` environment) is a separate change; `scripts/stage-installer-ps1.sh` and
+`tests/e2e/installer_signing.bats` are already here for it. Until it lands, do
+not tell users the Windows artifacts are signed.
+
+## Nix flake maintenance
+
+`nix profile install github:basecamp/hey-cli` builds from `nix/package.nix`.
+Stable releases bump its version and, when `go.mod`/`go.sum` moved, its
+`vendorHash` (requires Docker). To do it by hand, e.g. after an SDK bump:
+
+```bash
+make update-nix-hash
+```
+
+The PR-time `nix-build` job fails on every dependency bump by design — dependabot
+does not update `vendorHash` — and prints the correct hash with that command.
+
+`nix/package.nix` rebuilds Go from the upstream source tarball while
+nixpkgs-unstable lags `go.mod`'s toolchain (`minGo`). After a `nix flake update`
+that brings nixpkgs level, delete that block.
+
+## CLI surface compatibility
+
+`.surface` is the committed snapshot of commands and flags. `TestSurfaceSnapshot`
+fails a PR that changes the CLI without regenerating it, and the release `test`
+job diffs the current surface against the previous tag's so a removed command or
+flag cannot ship unnoticed.
+
+## Release size budget
+
+Not yet enforced. A budget (`.size-budget`) and `make check-size` land once the
+first release with in-process Sigstore verification (`hey upgrade`) has been
+measured; the numbers will be recorded here.
+
+## Things that look safe to rename but are not
+
+- **`.github/workflows/release.yml`** is part of every shipped binary's trust
+  identity: the installers and `hey upgrade` verify
+  `https://github.com/basecamp/hey-cli/.github/workflows/release.yml@refs/tags/v<ver>`.
+  Renaming the file invalidates verification for every binary already installed.
+- **Cask `hey` / Scoop `hey` / AUR `hey-cli`** names are what installed copies
+  upgrade through.
+
+## AUR
+
+The AUR package installs the prebuilt release binaries (with shell completions);
+`publish-aur.sh` derives the PKGBUILD from the published release assets. If the
+release-time publish fails (the AUR is down for maintenance regularly), a
+labeled `aur-publish` issue is filed and the release itself is unaffected.
+Recover by dispatching the `Publish to AUR` workflow with the released version —
+it is idempotent and refuses downgrades.
+
+One-time setup: `ssh-keygen -t ed25519 -f aur_key`, add the public key to the AUR
+account, store the private key as `AUR_KEY`.
+
+## Skills sync
+
+Stable releases mirror `skills/` into `basecamp/skills`. If that job fails, a
+`skills-sync`-labeled issue is filed; recover with the `Sync skills` workflow
+(`workflow_dispatch`, stable tag, optional dry run). It refuses anything but the
+latest stable release so it cannot roll the distribution repo back, and it runs
+the sync script from the dispatching branch against the tag's skills tree — so
+when the failure was a defect in `sync-skills.sh` itself, merge the fix to main
+and dispatch; no new release needed.
+
+## Local dry runs
+
+```bash
+make release VERSION=0.2.0 DRY_RUN=1   # preflight only
+make test-release                      # goreleaser snapshot, no publish/sign
+```
+
+`make test-release` needs `syft` on PATH for the SBOM step (`mise use syft`); it
+blanks the signing env so notarization is skipped, and the stable metadata
+check does not run for snapshots.
+
+## Distribution channels
 
 | Channel | Location | Updated by |
 |---------|----------|------------|
 | GitHub Releases | `basecamp/hey-cli/releases` | GoReleaser |
-| Homebrew | `basecamp/homebrew-tap` Casks/hey.rb | GoReleaser |
-| Scoop | `basecamp/homebrew-tap` hey.json | GoReleaser |
-| AUR | `aur.archlinux.org/packages/hey-cli` | `publish-aur.sh` |
-| deb/rpm | GitHub release assets | GoReleaser (nfpm) |
+| Installers | `scripts/install.sh`, `scripts/install.ps1` (served from main) | Merge to main; daily `installer-smoke` canary |
+| Homebrew cask `hey` | `basecamp/homebrew-tap` Casks/hey.rb | GoReleaser (stable) |
+| Scoop `hey` | `basecamp/homebrew-tap` hey.json | GoReleaser (stable) |
+| AUR `hey-cli` | `aur.archlinux.org/packages/hey-cli` | `publish-aur.sh` (stable) |
+| deb/rpm/apk | GitHub release assets | GoReleaser (nfpm) |
+| Nix flake | `flake.nix` | Self-serve |
 | Go install | `go install github.com/basecamp/hey-cli/cmd/hey@latest` | Go module proxy |
-| curl installer | `scripts/install.sh` | Manual |
-
-## Dry Run
-
-```bash
-# Full preflight without tagging
-make release VERSION=v1.0.0 DRY_RUN=1
-
-# GoReleaser snapshot (local build test; completions are generated by the before-hook,
-# SBOMs are skipped locally when syft is absent since it is only installed in CI)
-make test-release
-```
-
-## AUR Setup
-
-1. Generate ed25519 SSH keypair: `ssh-keygen -t ed25519 -f aur_key`
-2. Add public key to your AUR account profile
-3. Add private key as `AUR_KEY` secret on the hey-cli repo
-
-The AUR package installs the prebuilt release binaries (with shell completions),
-not a source build — `publish-aur.sh` derives the PKGBUILD from the published
-release assets.
-
-If the release-time publish fails (the AUR is down for maintenance regularly),
-a labeled `aur-publish` issue is filed and the release itself is unaffected.
-Recover by dispatching the `Publish to AUR` workflow with the released version —
-it is idempotent and refuses downgrades.
+| Claude plugin | `.claude-plugin/` | `stamp-plugin-version.sh` (stable) |
+| Skills | `basecamp/skills` | `sync-skills.sh` (stable) |
