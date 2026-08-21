@@ -8,7 +8,6 @@ import (
 
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/basecamp/hey-sdk/go/pkg/generated"
 	hey "github.com/basecamp/hey-sdk/go/pkg/hey"
@@ -20,6 +19,7 @@ import (
 	"github.com/basecamp/hey-cli/internal/mail"
 	"github.com/basecamp/hey-cli/internal/markdown"
 	"github.com/basecamp/hey-cli/internal/terminal"
+	"github.com/basecamp/hey-cli/internal/threadload"
 )
 
 // --- Mail messages ---
@@ -94,7 +94,11 @@ type topicLoadedMsg struct {
 	entries     []mail.Entry
 	attachments []messageAttachment
 	images      [][]byte
-	err         error
+	// notice says what the read did not get, or is empty; complete is whether it got
+	// everything — every entry in the index, every body within the limits.
+	notice   string
+	complete bool
+	err      error
 }
 
 type searchResultsLoadedMsg struct {
@@ -204,6 +208,8 @@ type mailView struct {
 	attachmentCursor int
 	imageContent     string
 	inThread         bool
+	threadNotice     string // what the open thread's read did not get; stays until the thread is left
+	contentHeight    int    // the rows the section has, which the thread's notices and viewport share
 
 	modal                  modal       // the form or picker over the list, and the only one there can be
 	cover                  coverPreset // the session's cover; HEY does not serve one to read
@@ -381,6 +387,8 @@ func (v *mailView) Update(msg tea.Msg) (tea.Cmd, bool) {
 		v.entries = msg.entries
 		v.attachments = msg.attachments
 		v.attachmentCursor = 0
+		v.threadNotice = msg.notice
+		v.fitThreadViewport()
 		var imageContent strings.Builder
 		var uploadCmds []tea.Cmd
 		for _, imgData := range msg.images {
@@ -396,7 +404,13 @@ func (v *mailView) Update(msg tea.Msg) (tea.Cmd, bool) {
 		v.imageContent = imageContent.String()
 		v.rebuildTopicContent()
 		v.topicViewport.GotoTop()
-		return tea.Batch(append(uploadCmds, v.markPostingSeen(msg.boxID, msg.postingID))...), true
+		// A thread read only in part is not marked seen by being opened: the reader has
+		// not had all of it, and seen would slide it under the Imbox's cover. The seen
+		// key is there for a thread they are done with anyway.
+		if msg.complete {
+			uploadCmds = append(uploadCmds, v.markPostingSeen(msg.boxID, msg.postingID))
+		}
+		return tea.Batch(uploadCmds...), true
 
 	case replyContextLoadedMsg:
 		if msg.boxID != v.currentBoxID() {
@@ -637,10 +651,12 @@ func (v *mailView) View() string {
 		return v.modal.draw(v)
 	}
 	if v.inThread {
-		if v.notice != "" {
-			return v.vc.styles.title.Render(v.notice) + "\n" + v.topicViewport.View()
+		v.fitThreadViewport()
+		var lines []string
+		for _, notice := range v.threadNotices() {
+			lines = append(lines, v.vc.styles.title.Render(notice))
 		}
-		return v.topicViewport.View()
+		return strings.Join(append(lines, v.topicViewport.View()), "\n")
 	}
 	if v.searchActive {
 		if v.notice != "" {
@@ -1056,6 +1072,7 @@ func (v *mailView) ExitThread() {
 	}
 	if v.inThread {
 		v.inThread = false
+		v.threadNotice = ""
 		v.modal = nil
 		v.requests.cancel()
 		return
@@ -1106,7 +1123,36 @@ func (v *mailView) Resize(width, height int) {
 	v.postingList.setSize(width, height)
 	v.searchList.setSize(width, height)
 	v.topicViewport.SetWidth(width)
-	v.topicViewport.SetHeight(height)
+	v.contentHeight = height
+	v.fitThreadViewport()
+}
+
+// threadNotices is what is shown above an open thread's viewport: the partial-read
+// notice for as long as the thread is open, and the one-shot notice while it is up. Each
+// is one row, truncated to the width, so the rows they take can be counted, and the
+// thread itself keeps at least one: in a section too short for both, a notice gives
+// way rather than pushing the viewport out.
+func (v *mailView) threadNotices() []string {
+	var notices []string
+	for _, notice := range []string{v.threadNotice, v.notice} {
+		if notice != "" {
+			notices = append(notices, truncateToWidth(notice, max(v.vc.width, 4)))
+		}
+	}
+	if room := max(v.contentHeight-1, 0); len(notices) > room {
+		notices = notices[:room]
+	}
+	return notices
+}
+
+// fitThreadViewport gives the thread's viewport the rows its notices leave, so the
+// section never draws more rows than it has. The one-shot notice comes and goes from
+// dozens of sites, so the fit is also checked where the thread is drawn.
+func (v *mailView) fitThreadViewport() {
+	height := max(v.contentHeight-len(v.threadNotices()), 1)
+	if v.topicViewport.Height() != height {
+		v.topicViewport.SetHeight(height)
+	}
 }
 
 // handleBoxShortcut handles number-key shortcuts for switching boxes.
@@ -1134,6 +1180,7 @@ func (v *mailView) switchBox(index int) tea.Cmd {
 		return nil
 	}
 	v.inThread = false
+	v.threadNotice = ""
 	v.clearSearch()
 	v.requests.cancel()
 	v.notice = ""
@@ -1960,68 +2007,62 @@ func (v *mailView) readSearchPage(ctx context.Context, query string, page int) (
 	return postings, nextPage, nil
 }
 
+// tuiThreadLimits is what the TUI reads a thread within: threadload's defaults, at the
+// TUI's own concurrency.
+var tuiThreadLimits = func() threadload.Limits {
+	limits := threadload.DefaultLimits
+	limits.Concurrency = maxConcurrentMessageFetches
+	return limits
+}()
+
+// fetchTopic reads a whole thread through threadload — every page of the index, every
+// body within the limits — and then its inline images within the image budget. A
+// thread read only in part is shown with a notice rather than refused: the reader is
+// looking at it, and can see what is missing.
 func (v *mailView) fetchTopic(ctx context.Context, requestID uint64, boxID, topicID, postingID int64, title string) tea.Cmd {
 	return func() tea.Msg {
-		topic, err := v.vc.sdk.Topics().Get(ctx, topicID)
+		thread, err := threadload.Load(ctx, threadload.NewSDKSource(v.vc.sdk), threadload.Request{
+			TopicID: topicID,
+			Hydrate: true,
+			Limits:  tuiThreadLimits,
+		})
 		if err != nil {
 			return topicLoadedMsg{requestID: requestID, boxID: boxID, topicID: topicID, title: title, err: err}
 		}
-		if topic == nil {
+		if len(thread.Entries) == 0 {
 			return topicLoadedMsg{requestID: requestID, boxID: boxID, topicID: topicID, title: title, err: fmt.Errorf("topic %d returned no data", topicID)}
 		}
 
-		messages := make([]generated.Message, len(topic.Entries))
-		group, groupCtx := errgroup.WithContext(ctx)
-		group.SetLimit(maxConcurrentMessageFetches)
-		for i, entry := range topic.Entries {
-			group.Go(func() error {
-				message, getErr := v.vc.sdk.Messages().Get(groupCtx, entry.Id)
-				if getErr != nil {
-					return fmt.Errorf("get message %d: %w", entry.Id, getErr)
-				}
-				if message == nil {
-					return fmt.Errorf("message %d returned no data", entry.Id)
-				}
-				messages[i] = *message
-				return nil
-			})
-		}
-		if getErr := group.Wait(); getErr != nil {
-			return topicLoadedMsg{
-				requestID: requestID,
-				boxID:     boxID,
-				topicID:   topicID,
-				title:     title,
-				err:       getErr,
-			}
-		}
-
-		entries := make([]mail.Entry, len(topic.Entries))
+		entries := make([]mail.Entry, len(thread.Entries))
 		var attachments []messageAttachment
-		for i, entry := range topic.Entries {
-			entries[i] = mail.NewEntry(entry, messages[i])
-			for position, attachment := range htmlutil.ExtractAttachments(messages[i].Content) {
+		var imageURLs []string
+		// Only a terminal that can draw the images pays for finding them.
+		wantImages := v.vc.imageRenderer.protocol() == imageProtocolKitty && v.vc.imageFetcher != nil
+		for i, loaded := range thread.Entries {
+			entries[i] = mail.LoadedEntry(loaded)
+			if loaded.Message == nil {
+				continue
+			}
+			for position, attachment := range htmlutil.ExtractAttachments(loaded.Message.Content) {
 				attachments = append(attachments, messageAttachment{
-					ID:          fmt.Sprintf("%d:%d", entry.Id, position+1),
-					MessageID:   entry.Id,
+					ID:          fmt.Sprintf("%d:%d", loaded.Entry.Id, position+1),
+					MessageID:   loaded.Entry.Id,
 					Filename:    attachment.Filename,
 					ContentType: attachment.ContentType,
 					ByteSize:    attachment.ByteSize,
 					URL:         attachment.URL,
 				})
 			}
+			if wantImages {
+				imageURLs = append(imageURLs, extractImageURLs(loaded.Message.Content)...)
+			}
+			// The loader's copy is released once the entry has what it shows.
+			thread.Entries[i].Message = nil
 		}
 
 		var images [][]byte
-		if v.vc.imageRenderer.protocol() == imageProtocolKitty && v.vc.imageFetcher != nil {
-			for _, entry := range entries {
-				for _, imageURL := range extractImageURLs(entry.BodyHTML) {
-					data, fetchErr := v.vc.imageFetcher.Fetch(ctx, imageURL)
-					if fetchErr == nil && len(data) > 0 {
-						images = append(images, data)
-					}
-				}
-			}
+		if wantImages {
+			images = newImageBudget().fetchImages(ctx, v.vc.imageFetcher, imageURLs)
 		}
 
 		return topicLoadedMsg{
@@ -2033,6 +2074,8 @@ func (v *mailView) fetchTopic(ctx context.Context, requestID uint64, boxID, topi
 			entries:     entries,
 			attachments: attachments,
 			images:      images,
+			notice:      thread.Notice(tuiThreadLimits),
+			complete:    thread.Complete(),
 		}
 	}
 }
@@ -2061,8 +2104,11 @@ func (v *mailView) renderEntries(entries []mail.Entry) string {
 		if e.Summary != "" {
 			fmt.Fprintf(&b, "%s\n", terminal.SanitizeLine(e.Summary))
 		}
-		if !e.Body.IsEmpty() {
+		switch {
+		case !e.Body.IsEmpty():
 			fmt.Fprintf(&b, "\n%s\n", v.vc.styles.entryBody.Render(markdown.Render(e.Body, sepWidth)))
+		case e.BodyState == string(threadload.StateOverLimit), e.BodyState == string(threadload.StateFailed):
+			fmt.Fprintf(&b, "\n%s\n", v.vc.styles.entryDate.Render("(body not read: "+e.BodyState+")"))
 		}
 		entryAttachments := attachmentsForMessage(v.attachments, e.ID)
 		if panel := renderAttachmentPanel(entryAttachments, selectedAttachmentForMessage(v.attachments, v.attachmentCursor, e.ID)); panel != "" {

@@ -75,8 +75,12 @@ func TestTrustedImageFetcherRejectsLookalikeAndUnsafeOrigins(t *testing.T) {
 		"file:///etc/passwd",
 	} {
 		t.Run(source, func(t *testing.T) {
-			if _, err := fetcher.Fetch(context.Background(), source); err == nil {
+			_, err := fetcher.Fetch(context.Background(), source, 0)
+			if err == nil {
 				t.Fatalf("unsafe image URL succeeded: %s", source)
+			}
+			if !errors.Is(err, errImageRefused) {
+				t.Errorf("error = %v, want a refusal without a request", err)
 			}
 		})
 	}
@@ -99,7 +103,7 @@ func TestTrustedImageFetcherRejectsURLCredentialsBeforeRequest(t *testing.T) {
 	parsed.User = url.UserPassword("user", "password")
 	fetcher := newTrustedImageFetcherWithOrigins(rejectingImageBlobDownloader(t), "https://app.hey.com", gopher.URL)
 
-	if _, err := fetcher.Fetch(context.Background(), parsed.String()); err == nil {
+	if _, err := fetcher.Fetch(context.Background(), parsed.String(), 0); err == nil {
 		t.Fatal("image URL containing credentials succeeded")
 	}
 	if got := requests.Load(); got != 0 {
@@ -114,7 +118,7 @@ func TestTrustedImageFetcherRejectsNetworkPathURL(t *testing.T) {
 		"https://gopher.hey.com",
 	)
 
-	if _, err := fetcher.Fetch(context.Background(), "//127.0.0.1/internal.png"); err == nil {
+	if _, err := fetcher.Fetch(context.Background(), "//127.0.0.1/internal.png", 0); err == nil {
 		t.Fatal("network-path image URL succeeded")
 	}
 }
@@ -134,7 +138,7 @@ func TestTrustedImageFetcherLoadsRelativeAndSameOriginHEYImages(t *testing.T) {
 			})
 			fetcher := newTrustedImageFetcherWithOrigins(downloader, "https://app.hey.com", "https://gopher.hey.com")
 
-			got, err := fetcher.Fetch(context.Background(), source)
+			got, err := fetcher.Fetch(context.Background(), source, 0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -153,7 +157,7 @@ func TestTrustedImageFetcherRejectsOversizedHEYImage(t *testing.T) {
 	fetcher := newTrustedImageFetcherWithOrigins(downloader, "https://app.hey.com", "https://gopher.hey.com")
 	fetcher.maxBytes = 8
 
-	if _, err := fetcher.Fetch(context.Background(), "/image.png"); err == nil {
+	if _, err := fetcher.Fetch(context.Background(), "/image.png", 0); err == nil {
 		t.Fatal("oversized HEY image succeeded")
 	}
 }
@@ -174,7 +178,7 @@ func TestTrustedImageFetcherLoadsImageFromGopherWithoutHEYCredentials(t *testing
 		gopher.URL,
 	)
 
-	got, err := fetcher.Fetch(context.Background(), gopher.URL+"/signed/image.png")
+	got, err := fetcher.Fetch(context.Background(), gopher.URL+"/signed/image.png", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +206,7 @@ func TestTrustedImageFetcherAcceptsAnImageWithNoContentType(t *testing.T) {
 		gopher.URL,
 	)
 
-	got, err := fetcher.Fetch(context.Background(), gopher.URL+"/image.png")
+	got, err := fetcher.Fetch(context.Background(), gopher.URL+"/image.png", 0)
 	if err != nil {
 		t.Fatalf("image without a Content-Type was rejected: %v", err)
 	}
@@ -224,7 +228,7 @@ func TestTrustedImageFetcherRejectsNonImageContent(t *testing.T) {
 		gopher.URL,
 	)
 
-	if _, err := fetcher.Fetch(context.Background(), gopher.URL+"/image.png"); err == nil {
+	if _, err := fetcher.Fetch(context.Background(), gopher.URL+"/image.png", 0); err == nil {
 		t.Fatal("non-image Gopher response succeeded")
 	}
 }
@@ -247,7 +251,7 @@ func TestTrustedImageFetcherRejectsExcessivePixelDimensions(t *testing.T) {
 		gopher.URL,
 	)
 
-	if _, err := fetcher.Fetch(context.Background(), gopher.URL+"/image.png"); err == nil {
+	if _, err := fetcher.Fetch(context.Background(), gopher.URL+"/image.png", 0); err == nil {
 		t.Fatal("image with excessive pixel dimensions succeeded")
 	}
 }
@@ -265,7 +269,7 @@ func TestTrustedImageFetcherRejectsMalformedImage(t *testing.T) {
 		gopher.URL,
 	)
 
-	if _, err := fetcher.Fetch(context.Background(), gopher.URL+"/image.png"); err == nil {
+	if _, err := fetcher.Fetch(context.Background(), gopher.URL+"/image.png", 0); err == nil {
 		t.Fatal("malformed image succeeded")
 	}
 }
@@ -284,7 +288,7 @@ func TestTrustedImageFetcherRejectsOversizedGopherImage(t *testing.T) {
 	)
 	fetcher.maxBytes = 8
 
-	if _, err := fetcher.Fetch(context.Background(), gopher.URL+"/image.png"); err == nil {
+	if _, err := fetcher.Fetch(context.Background(), gopher.URL+"/image.png", 0); err == nil {
 		t.Fatal("oversized Gopher image succeeded")
 	}
 }
@@ -309,7 +313,7 @@ func TestTrustedImageFetcherRejectsGopherRedirectOutsideTrustedOrigin(t *testing
 		gopher.URL,
 	)
 
-	if _, err := fetcher.Fetch(context.Background(), gopher.URL+"/signed/image.png"); err == nil {
+	if _, err := fetcher.Fetch(context.Background(), gopher.URL+"/signed/image.png", 0); err == nil {
 		t.Fatal("Gopher redirect to an untrusted origin succeeded")
 	}
 	if got := untrustedRequests.Load(); got != 0 {
