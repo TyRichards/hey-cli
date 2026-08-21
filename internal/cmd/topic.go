@@ -59,6 +59,7 @@ func newThreadsCommand() *topicCommand {
 		},
 		Example: `  hey threads 12345
   hey threads 12345 --json
+  hey threads 12345 --markdown
   hey threads 12345 --count
   hey threads 12345 --allow-partial`,
 		RunE: threadsCommand.run,
@@ -92,12 +93,12 @@ func (c *topicCommand) run(cmd *cobra.Command, args []string) error {
 	if notice != "" && !c.allowPartial {
 		return errPartialThread(threadID, notice)
 	}
-	entries := threadEntries(thread)
+	entries := threadEntries(thread, format == output.FormatHTML)
 
-	// The envelope carries the notice and the styled view prints it; every other
-	// format — a count, IDs, --quiet, --html — gets it on stderr, so what is missing
-	// is said wherever the output cannot say it.
-	if stderrNotice := paginationNoticeForStderr(format, notice); stderrNotice != "" {
+	// The envelope carries the notice, the styled view and the Markdown document
+	// print it; every other format — a count, IDs, --quiet, --html — gets it on stderr,
+	// so what is missing is said wherever the output cannot say it.
+	if stderrNotice := paginationNoticeForStderr(format, notice); stderrNotice != "" && format != output.FormatMarkdown {
 		fmt.Fprintln(cmd.ErrOrStderr(), stderrNotice)
 	}
 
@@ -107,9 +108,11 @@ func (c *topicCommand) run(cmd *cobra.Command, args []string) error {
 	case output.FormatStyled:
 		printThreadStyled(cmd.OutOrStdout(), entries, notice)
 		return nil
+	case output.FormatMarkdown:
+		return writeThreadMarkdown(cmd.OutOrStdout(), threadID, entries, notice)
 	case output.FormatCount, output.FormatIDs:
 		return writeOK(entries)
-	case output.FormatAuto, output.FormatJSON, output.FormatQuiet, output.FormatMarkdown:
+	case output.FormatAuto, output.FormatJSON, output.FormatQuiet:
 	}
 
 	return writeOK(entries,
@@ -160,6 +163,58 @@ func printThreadStyled(w io.Writer, entries []threadEntry, notice string) {
 	}
 }
 
+// writeThreadMarkdown writes a thread as one Markdown document: a heading per entry
+// naming the sender, the date and the entry ID, the body as the Markdown it already is,
+// and a rule between entries. The metadata is escaped for a Markdown reader the way the
+// body already was by ToMarkdown; a body that rendered to nothing says so, an entry HEY
+// served no body for shows its summary, and one whose body was not read says so. A
+// write that fails is the command's error, as it is for --html: a document cut short by
+// a full disk must not exit 0.
+func writeThreadMarkdown(w io.Writer, threadID int64, entries []threadEntry, notice string) error {
+	// The document is written an entry at a time rather than assembled whole: a thread
+	// is held once as Markdown, not a second time as the document.
+	write := func(s string) error {
+		if _, err := io.WriteString(w, s); err != nil {
+			return fmt.Errorf("write thread Markdown: %w", err)
+		}
+		return nil
+	}
+	if err := write(fmt.Sprintf("# Thread %d\n", threadID)); err != nil {
+		return err
+	}
+	for _, e := range entries {
+		var b strings.Builder
+		b.WriteString("\n")
+		fmt.Fprintf(&b, "## From: %s — %s (#%d)\n\n", markdownSafeText(threadEntrySender(e)), e.CreatedAt, e.ID)
+		if err := write(b.String()); err != nil {
+			return err
+		}
+		var body string
+		switch {
+		case e.Body != "":
+			body = e.Body + "\n"
+		case e.BodyState == string(threadload.StateHydrated):
+			body = "*(empty body)*\n"
+		case e.BodyState == string(threadload.StateBodyless) && e.Summary != "":
+			body = markdownSafeText(e.Summary) + "\n"
+		case e.BodyState == string(threadload.StateBodyless):
+			body = "*(no body)*\n"
+		default:
+			body = fmt.Sprintf("*(body not read: %s)*\n", e.BodyState)
+		}
+		if err := write(body); err != nil {
+			return err
+		}
+		if err := write("\n---\n"); err != nil {
+			return err
+		}
+	}
+	if notice != "" {
+		return write(fmt.Sprintf("\n**Notice:** %s\n", markdownSafeText(notice)))
+	}
+	return nil
+}
+
 // writeThreadHTML is what --html writes for a thread: each entry's original HTML, oldest
 // first, each introduced by a comment naming the entry, its sender and its date, with a
 // blank line between entries. An entry without a body says why in its comment. A write
@@ -200,17 +255,19 @@ func threadEntrySender(entry threadEntry) string {
 	}
 }
 
-// threadEntries is a loaded thread in the CLI's shape, oldest first, each body
-// converted to Markdown once.
-func threadEntries(thread *threadload.Thread) []threadEntry {
+// threadEntries is a loaded thread in the CLI's shape, oldest first. A thread is held
+// in one form: --html keeps each body's HTML and converts nothing, every other format
+// converts each body to Markdown once and lets the HTML go, so a body is never held as
+// both — Markdown can be several times the size of the HTML it came from.
+func threadEntries(thread *threadload.Thread, html bool) []threadEntry {
 	entries := make([]threadEntry, len(thread.Entries))
-	for i, loaded := range thread.Entries {
-		entries[i] = newThreadEntry(loaded)
+	for i := range thread.Entries {
+		entries[i] = newThreadEntry(&thread.Entries[i], html)
 	}
 	return entries
 }
 
-func newThreadEntry(loaded threadload.Entry) threadEntry {
+func newThreadEntry(loaded *threadload.Entry, html bool) threadEntry {
 	entry := loaded.Entry
 	creator := entry.Creator
 	createdAt := entry.CreatedAt
@@ -235,8 +292,13 @@ func newThreadEntry(loaded threadload.Entry) threadEntry {
 		if appURL == "" {
 			appURL = message.Url
 		}
-		body = htmlutil.ToMarkdown(message.Content)
-		bodyHTML = message.Content
+		if html {
+			bodyHTML = message.Content
+		} else {
+			body = htmlutil.ToMarkdown(message.Content)
+		}
+		// The loaded thread's copy is released as it is converted.
+		loaded.Message = nil
 	}
 
 	return threadEntry{
