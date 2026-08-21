@@ -10,7 +10,9 @@ import (
 	"unicode/utf8"
 
 	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/extension"
+	"github.com/yuin/goldmark/text"
 	"golang.org/x/net/html"
 )
 
@@ -89,7 +91,7 @@ func hasControl(s string) bool {
 // in the email, and a Markdown renderer that decodes entities would turn them into
 // a live escape byte.
 func TestToMarkdownTextEntityCannotDecodeTwice(t *testing.T) {
-	got := ToMarkdown(`<p>hello &amp;#27;[31mRED</p>`)
+	got := toMarkdown(`<p>hello &amp;#27;[31mRED</p>`)
 	if got != `hello &amp;#27;\[31mRED` {
 		t.Errorf("ToMarkdown = %q", got)
 	}
@@ -118,7 +120,7 @@ func TestToMarkdownTextIsNeverSyntax(t *testing.T) {
 		"a | b",
 		"back\\slash",
 	} {
-		md := ToMarkdown("<p>" + html.EscapeString(literal) + "</p>")
+		md := toMarkdown("<p>" + html.EscapeString(literal) + "</p>")
 		if got := renderedText(t, md); got != literal {
 			t.Errorf("%q: ToMarkdown = %q renders as %q", literal, md, got)
 		}
@@ -138,7 +140,7 @@ func TestToMarkdownTextIsNeverSyntaxAcrossNodes(t *testing.T) {
 		{`<p><span>&amp;</span>amp;</p>`, "&amp;"},
 		{`<p><span>*</span>x<span>*</span></p>`, "*x*"},
 	} {
-		md := ToMarkdown(test.in)
+		md := toMarkdown(test.in)
 		if got := renderedText(t, md); got != test.literal {
 			t.Errorf("%s: ToMarkdown = %q renders as %q, want %q", test.in, md, got, test.literal)
 		}
@@ -149,7 +151,7 @@ func TestToMarkdownTextIsNeverSyntaxAcrossNodes(t *testing.T) {
 }
 
 func TestToMarkdownKeepsTheReplacementCharacter(t *testing.T) {
-	got := ToMarkdown("<p>caf\uFFFDe <code>\uFFFD</code></p>")
+	got := toMarkdown("<p>caf\uFFFDe <code>\uFFFD</code></p>")
 	if got != "caf\uFFFDe `\uFFFD`" {
 		t.Errorf("ToMarkdown = %q", got)
 	}
@@ -164,14 +166,14 @@ func TestToMarkdownTextStripsControls(t *testing.T) {
 		"del":             "<p>note\x7f</p>",
 		"carriage return": "<p>Invoice\rPAID</p>",
 	} {
-		if got := ToMarkdown(in); hasControl(got) {
+		if got := toMarkdown(in); hasControl(got) {
 			t.Errorf("%s: ToMarkdown = %q carries a control character", name, got)
 		}
 	}
 }
 
 func TestToMarkdownInlineCodeEntityCannotDecode(t *testing.T) {
-	got := ToMarkdown(`<p><code>&amp;#27;[31mRED</code></p>`)
+	got := toMarkdown(`<p><code>&amp;#27;[31mRED</code></p>`)
 	if got != "`&#27;[31mRED`" {
 		t.Errorf("ToMarkdown = %q", got)
 	}
@@ -192,7 +194,7 @@ func TestToMarkdownInlineCodeSizesItsDelimiters(t *testing.T) {
 		{"<code>a\nb</code>", "`a b`", "a b"},
 		{"<code></code>", "", ""},
 	} {
-		got := ToMarkdown("<p>" + test.in + "</p>")
+		got := toMarkdown("<p>" + test.in + "</p>")
 		if got != test.want {
 			t.Errorf("%s: ToMarkdown = %q, want %q", test.in, got, test.want)
 		}
@@ -210,7 +212,7 @@ func TestToMarkdownInlineCodeSizesItsDelimiters(t *testing.T) {
 }
 
 func TestToMarkdownFencedCodeCannotBeClosedFromInside(t *testing.T) {
-	got := ToMarkdown("<pre>first\n```\nnot outside\n</pre><p>after</p>")
+	got := toMarkdown("<pre>first\n```\nnot outside\n</pre><p>after</p>")
 	want := "````\nfirst\n```\nnot outside\n````\n\nafter"
 	if got != want {
 		t.Errorf("ToMarkdown = %q, want %q", got, want)
@@ -222,7 +224,7 @@ func TestToMarkdownFencedCodeCannotBeClosedFromInside(t *testing.T) {
 }
 
 func TestToMarkdownFencedCodeKeepsBlankLinesAndStripsControls(t *testing.T) {
-	got := ToMarkdown("<pre>one\n\n\x1b[31mtwo\t3</pre>")
+	got := toMarkdown("<pre>one\n\n\x1b[31mtwo\t3</pre>")
 	want := "```\none\n\n[31mtwo\t3\n```"
 	if got != want {
 		t.Errorf("ToMarkdown = %q, want %q", got, want)
@@ -239,7 +241,7 @@ func TestToMarkdownFencedCodeInfoStringIsALanguageOrNothing(t *testing.T) {
 		{"language-" + strings.Repeat("x", 40), "```"},
 		{"language-\x1b[31m", "```"},
 	} {
-		got := ToMarkdown(`<pre><code class="` + test.class + `">x</code></pre>`)
+		got := toMarkdown(`<pre><code class="` + test.class + `">x</code></pre>`)
 		if first := strings.SplitN(got, "\n", 2)[0]; first != test.want {
 			t.Errorf("%s: fence = %q, want %q", test.class, first, test.want)
 		}
@@ -249,7 +251,7 @@ func TestToMarkdownFencedCodeInfoStringIsALanguageOrNothing(t *testing.T) {
 // A closing parenthesis in an href would end the Markdown destination, leaving the
 // rest of the attribute in the paragraph as text a renderer parses.
 func TestToMarkdownDestinationCannotExitTheLink(t *testing.T) {
-	got := ToMarkdown(`<p><a href=")&#27;[31mRED">x</a></p>`)
+	got := toMarkdown(`<p><a href=")&#27;[31mRED">x</a></p>`)
 	if got != "[x](%29[31mRED)" {
 		t.Errorf("ToMarkdown = %q", got)
 	}
@@ -265,7 +267,7 @@ func TestToMarkdownDestinationCannotExitTheLink(t *testing.T) {
 }
 
 func TestToMarkdownDestinationKeepsQueryStrings(t *testing.T) {
-	got := ToMarkdown(`<p><a href="https://example.com/a?b=1&amp;c=2&amp;#27;&amp;copy=1">q</a></p>`)
+	got := toMarkdown(`<p><a href="https://example.com/a?b=1&amp;c=2&amp;#27;&amp;copy=1">q</a></p>`)
 	if got != "[q](https://example.com/a?b=1&c=2&amp;#27;&copy=1)" {
 		t.Errorf("ToMarkdown = %q", got)
 	}
@@ -275,7 +277,7 @@ func TestToMarkdownDestinationKeepsQueryStrings(t *testing.T) {
 }
 
 func TestToMarkdownDestinationEncodesWhatWouldEndIt(t *testing.T) {
-	got := ToMarkdown(`<p><a href="https://example.com/a b(c)<d>\e|f">x</a></p>`)
+	got := toMarkdown(`<p><a href="https://example.com/a b(c)<d>\e|f">x</a></p>`)
 	want := `[x](https://example.com/a%20b%28c%29%3Cd%3E%5Ce%7Cf)`
 	if got != want {
 		t.Errorf("ToMarkdown = %q, want %q", got, want)
@@ -302,7 +304,7 @@ func TestToMarkdownDestinationSchemes(t *testing.T) {
 		{"  javascript:alert(1)", "x", false},
 		{"", "x", false},
 	} {
-		got := ToMarkdown(`<p><a href="` + html.EscapeString(test.href) + `">x</a></p>`)
+		got := toMarkdown(`<p><a href="` + html.EscapeString(test.href) + `">x</a></p>`)
 		if got != test.want {
 			t.Errorf("%q: ToMarkdown = %q, want %q", test.href, got, test.want)
 		}
@@ -320,7 +322,7 @@ func TestToMarkdownAutolinkOnlyForAbsoluteURLs(t *testing.T) {
 		{`<a href="/rails/blobs/q3.pdf"></a>`, "[/rails/blobs/q3.pdf](/rails/blobs/q3.pdf)"},
 		{`<a href="https://example.org/a b">https://example.org/a b</a>`, "<https://example.org/a%20b>"},
 	} {
-		if got := ToMarkdown("<p>" + test.in + "</p>"); got != test.want {
+		if got := toMarkdown("<p>" + test.in + "</p>"); got != test.want {
 			t.Errorf("%s: ToMarkdown = %q, want %q", test.in, got, test.want)
 		}
 	}
@@ -329,7 +331,7 @@ func TestToMarkdownAutolinkOnlyForAbsoluteURLs(t *testing.T) {
 // A label that reads as one URL while pointing at another never collapses into an
 // autolink: the destination is written beside the label, where it can be compared.
 func TestToMarkdownDeceptiveLabelShowsTheDestination(t *testing.T) {
-	got := ToMarkdown(`<p><a href="https://evil.example/login">https://bank.example/login</a></p>`)
+	got := toMarkdown(`<p><a href="https://evil.example/login">https://bank.example/login</a></p>`)
 	want := "[https://bank.example/login](https://evil.example/login)"
 	if got != want {
 		t.Errorf("ToMarkdown = %q, want %q", got, want)
@@ -337,7 +339,7 @@ func TestToMarkdownDeceptiveLabelShowsTheDestination(t *testing.T) {
 }
 
 func TestToMarkdownImageAltAndSourceAreSerialized(t *testing.T) {
-	got := ToMarkdown(`<p><img alt="a]b &amp;#27;" src="https://example.com/i.png?x=1&amp;y=2"> <img alt="gone" src="javascript:x"> <img src="data:image/png;base64,AAAA"></p>`)
+	got := toMarkdown(`<p><img alt="a]b &amp;#27;" src="https://example.com/i.png?x=1&amp;y=2"> <img alt="gone" src="javascript:x"> <img src="data:image/png;base64,AAAA"></p>`)
 	want := `![a\]b &amp;#27;](https://example.com/i.png?x=1&y=2) gone`
 	if got != want {
 		t.Errorf("ToMarkdown = %q, want %q", got, want)
@@ -350,7 +352,7 @@ func TestToMarkdownImageAltAndSourceAreSerialized(t *testing.T) {
 // An image whose source may not be linked leaves its alt text as prose, escaped as
 // prose: at the start of a line "# title" is a heading unless it is escaped there.
 func TestToMarkdownUnlinkableImageAltIsProse(t *testing.T) {
-	got := ToMarkdown(`<p><img alt="# title" src="javascript:x"></p>`)
+	got := toMarkdown(`<p><img alt="# title" src="javascript:x"></p>`)
 	if got != `\# title` {
 		t.Errorf("ToMarkdown = %q", got)
 	}
@@ -360,7 +362,7 @@ func TestToMarkdownUnlinkableImageAltIsProse(t *testing.T) {
 }
 
 func TestToMarkdownAttachmentNamesAreSerialized(t *testing.T) {
-	got := ToMarkdown(`<figure data-trix-attachment='{"url":"javascript:x","filename":"*report*.png","contentType":"image/png"}'></figure>` +
+	got := toMarkdown(`<figure data-trix-attachment='{"url":"javascript:x","filename":"*report*.png","contentType":"image/png"}'></figure>` +
 		`<figure data-trix-attachment='{"url":"/rails/blobs/q3.pdf","filename":"[q3].pdf","contentType":"application/pdf"}'></figure>`)
 	want := "📎 \\*report\\*.png\n\n📎 \\[q3\\].pdf"
 	if got != want {
@@ -369,7 +371,7 @@ func TestToMarkdownAttachmentNamesAreSerialized(t *testing.T) {
 }
 
 func TestToMarkdownTableCellsEscapePipes(t *testing.T) {
-	got := ToMarkdown("<table><tr><th>a|b</th></tr><tr><td>c | d</td></tr></table>")
+	got := toMarkdown("<table><tr><th>a|b</th></tr><tr><td>c | d</td></tr></table>")
 	want := "| a\\|b |\n| --- |\n| c \\| d |"
 	if got != want {
 		t.Errorf("ToMarkdown = %q, want %q", got, want)
@@ -384,7 +386,7 @@ func TestToMarkdownTableCellsEscapePipes(t *testing.T) {
 func TestToMarkdownEscapesALongLineInLinearTime(t *testing.T) {
 	long := strings.Repeat("a.b)c. ", 100_000)
 	start := time.Now()
-	got := ToMarkdown("<p>" + long + "</p>")
+	got := toMarkdown("<p>" + long + "</p>")
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("ToMarkdown took %s on a %d-byte line", elapsed, len(long))
 	}
@@ -399,11 +401,11 @@ func TestToMarkdownEscapesALongLineInLinearTime(t *testing.T) {
 func TestToMarkdownAllocatesLinearly(t *testing.T) {
 	allocated := func(size int) uint64 {
 		body := "<p>" + strings.Repeat("Fried &amp; Hansson <b>shipped</b> it. ", size/40) + "</p>"
-		ToMarkdown(body)
+		toMarkdown(body)
 		var before, after runtime.MemStats
 		runtime.GC()
 		runtime.ReadMemStats(&before)
-		ToMarkdown(body)
+		toMarkdown(body)
 		runtime.ReadMemStats(&after)
 		return after.TotalAlloc - before.TotalAlloc
 	}
@@ -414,7 +416,7 @@ func TestToMarkdownAllocatesLinearly(t *testing.T) {
 }
 
 func TestToMarkdownBoundsQuoteAndListDepth(t *testing.T) {
-	quotes := ToMarkdown(strings.Repeat("<blockquote>", 40) + "deep" + strings.Repeat("</blockquote>", 40))
+	quotes := toMarkdown(strings.Repeat("<blockquote>", 40) + "deep" + strings.Repeat("</blockquote>", 40))
 	if got := strings.Count(quotes, ">"); got != maxNestingDepth {
 		t.Errorf("quote depth = %d, want %d: %q", got, maxNestingDepth, quotes)
 	}
@@ -423,7 +425,7 @@ func TestToMarkdownBoundsQuoteAndListDepth(t *testing.T) {
 	for range 40 {
 		b.WriteString("<ul><li>item")
 	}
-	lists := ToMarkdown(b.String())
+	lists := toMarkdown(b.String())
 	for _, line := range strings.Split(lists, "\n") {
 		if indent := len(line) - len(strings.TrimLeft(line, " ")); indent > 2*(maxNestingDepth-1) {
 			t.Errorf("list indented %d columns, want at most %d: %q", indent, 2*(maxNestingDepth-1), line)
@@ -442,7 +444,7 @@ func TestToMarkdownCappedListItemsStayApart(t *testing.T) {
 		b.WriteString("<ul><li>outer")
 	}
 	b.WriteString("<ul><li>b</li><li>c</li></ul>")
-	got := ToMarkdown(b.String())
+	got := toMarkdown(b.String())
 	if strings.Contains(got, "bc") || !strings.Contains(got, "- b\n") || !strings.Contains(got, "- c") {
 		t.Errorf("ToMarkdown = %q, want b and c as separate items", got)
 	}
@@ -452,12 +454,58 @@ func TestToMarkdownCappedListItemsStayApart(t *testing.T) {
 }
 
 func TestToMarkdownDeepNestingIsText(t *testing.T) {
-	got := ToMarkdown(strings.Repeat("<div>", 5000) + "x" + strings.Repeat("</div>", 5000))
+	got := toMarkdown(strings.Repeat("<div>", 5000) + "x" + strings.Repeat("</div>", 5000))
 	if hasControl(got) {
 		t.Errorf("ToMarkdown carries a control character")
 	}
 	if rendered := renderedHTML(t, got); strings.Contains(rendered, "<div>") {
 		t.Errorf("rendered = %.80q, want no raw HTML", rendered)
+	}
+}
+
+// assertSafeTree holds the serializer property on goldmark's own tree: Markdown from
+// ToMarkdown parses to no raw HTML, links and images only to allowed destinations, and
+// text with no control character in it. It is the AST-level statement of what the four
+// serializers promise, and the one a future serializer has to keep.
+func assertSafeTree(t *testing.T, md string) {
+	t.Helper()
+	source := []byte(md)
+	doc := conformant.Parser().Parse(text.NewReader(source))
+	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		switch n := n.(type) {
+		case *ast.RawHTML, *ast.HTMLBlock:
+			t.Errorf("ToMarkdown produced raw HTML in %q", md)
+		case *ast.Link:
+			if !allowedScheme(string(n.Destination)) || hasControl(string(n.Destination)) {
+				t.Errorf("ToMarkdown linked to %q in %q", n.Destination, md)
+			}
+		case *ast.Image:
+			if !allowedScheme(string(n.Destination)) || hasControl(string(n.Destination)) {
+				t.Errorf("ToMarkdown imaged %q in %q", n.Destination, md)
+			}
+		case *ast.AutoLink:
+			if url := string(n.URL(source)); !allowedScheme(url) || hasControl(url) {
+				t.Errorf("ToMarkdown autolinked %q in %q", url, md)
+			}
+		case *ast.Text:
+			if hasControl(string(n.Segment.Value(source))) {
+				t.Errorf("ToMarkdown left a control in %q", md)
+			}
+		}
+		return ast.WalkContinue, nil
+	})
+}
+
+func TestToMarkdownTreeIsSafe(t *testing.T) {
+	for _, in := range []string{
+		`<p>hello &amp;#27;[31mRED <a href="javascript:alert(1)">x</a> <img src="data:x" alt="a"> <b>&lt;script&gt;</b></p>`,
+		`<p><a href=")&#27;[31m">x</a> <a href="https://example.com/a?b=1&amp;c=2">q</a></p>`,
+		"<pre>```\n&amp;#27;</pre><table><tr><td>&amp;#27;|</td></tr></table>",
+	} {
+		assertSafeTree(t, toMarkdown(in))
 	}
 }
 
@@ -483,16 +531,17 @@ func FuzzToMarkdownTerminalSafety(f *testing.F) {
 		if !utf8.ValidString(in) {
 			t.Skip()
 		}
-		md := ToMarkdown(in)
+		md := toMarkdown(in)
 		if hasControl(md) {
-			t.Fatalf("ToMarkdown(%q) = %q carries a control character", in, md)
+			t.Fatalf("toMarkdown(%q) = %q carries a control character", in, md)
 		}
 		var out bytes.Buffer
 		if err := conformant.Convert([]byte(md), &out); err != nil {
 			t.Fatalf("goldmark: %v", err)
 		}
 		if text := domText(t, out.String()); hasControl(text) {
-			t.Fatalf("ToMarkdown(%q) = %q renders with a control character: %q", in, md, text)
+			t.Fatalf("toMarkdown(%q) = %q renders with a control character: %q", in, md, text)
 		}
+		assertSafeTree(t, md)
 	})
 }
