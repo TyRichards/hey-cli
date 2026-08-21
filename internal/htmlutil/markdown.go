@@ -13,29 +13,33 @@ import (
 // flattened email throws away: link URLs, emphasis, headings, list nesting,
 // quotes, code blocks and tables.
 func ToMarkdown(s string) string {
+	m := &markdownizer{}
 	doc, err := html.Parse(strings.NewReader(s))
 	if err != nil {
-		return s
+		m.writeText(s)
+	} else {
+		m.walk(doc)
 	}
-	m := &markdownizer{}
-	m.walk(doc)
 	return m.String()
 }
 
 type markdownizer struct {
 	lines         []string
-	line          string
+	line          strings.Builder
 	prefix        string
 	pendingPrefix string
 	lists         []*listLevel
-	preformatted  bool
 	breaking      bool
 	depth         int
+	quoteDepth    int
 }
 
+// listLevel is one level of list nesting: its kind, its count so far, and the prefix
+// its items' markers sit behind, which is the prefix in force where the list began.
 type listLevel struct {
 	ordered bool
 	number  int
+	prefix  string
 }
 
 func inlineMarkdown(n *html.Node) string {
@@ -94,7 +98,7 @@ func (m *markdownizer) element(n *html.Node) {
 	case "del", "s", "strike":
 		m.emphasis(n, "~~")
 	case "code":
-		m.emphasis(n, "`")
+		m.code(n)
 	case "a":
 		m.link(n)
 	case "img":
@@ -116,15 +120,28 @@ func (m *markdownizer) heading(n *html.Node) {
 	})
 }
 
+// maxNestingDepth is how deep quotes and lists nest before a deeper one is rendered at
+// the same level. glamour's cost grows exponentially with quote depth and faster than
+// linearly with list depth, and a reply chain quoting itself a hundred deep is either
+// an attack or unreadable.
+const maxNestingDepth = 16
+
 func (m *markdownizer) blockquote(n *html.Node) {
+	if m.quoteDepth >= maxNestingDepth {
+		m.block(func() { m.children(n) })
+		return
+	}
+
 	outer := m.prefix
 	m.flushLine()
 	m.blank()
 	m.prefix = outer + "> "
+	m.quoteDepth++
 	start := len(m.lines)
 	m.children(n)
 	m.flushLine()
 	m.trimBlankLines(start)
+	m.quoteDepth--
 	m.prefix = outer
 	m.blank()
 }
@@ -140,23 +157,34 @@ func (m *markdownizer) trimBlankLines(start int) {
 }
 
 func (m *markdownizer) list(n *html.Node) {
-	level := &listLevel{ordered: n.Data == "ol"}
+	if len(m.lists) >= maxNestingDepth {
+		// A list nested past the cap is rendered at the current level: each of its
+		// items is still an item, with its marker and its own line.
+		m.listItems(n, m.lists[len(m.lists)-1])
+		return
+	}
+
+	level := &listLevel{ordered: n.Data == "ol", prefix: m.prefix}
 	m.lists = append(m.lists, level)
 	m.flushLine()
 	if len(m.lists) == 1 {
 		m.blank()
 	}
+	m.listItems(n, level)
+	m.flushLine()
+	m.lists = m.lists[:len(m.lists)-1]
+	if len(m.lists) == 0 {
+		m.blank()
+	}
+}
+
+func (m *markdownizer) listItems(n *html.Node, level *listLevel) {
 	for child := n.FirstChild; child != nil; child = child.NextSibling {
 		if child.Type == html.ElementNode && child.Data == "li" {
 			m.listItem(child, level)
 		} else {
 			m.walk(child)
 		}
-	}
-	m.flushLine()
-	m.lists = m.lists[:len(m.lists)-1]
-	if len(m.lists) == 0 {
-		m.blank()
 	}
 }
 
@@ -169,28 +197,56 @@ func (m *markdownizer) listItem(n *html.Node, level *listLevel) {
 
 	outer := m.prefix
 	m.flushLine()
-	m.pendingPrefix = outer + marker
-	m.prefix = outer + strings.Repeat(" ", len(marker))
+	m.pendingPrefix = level.prefix + marker
+	m.prefix = level.prefix + strings.Repeat(" ", len(marker))
 	m.children(n)
 	m.flushLine()
 	m.pendingPrefix = ""
 	m.prefix = outer
 }
 
+// codeBlock writes preformatted text inside a fence no line of it can close. Backslashes
+// mean nothing in a fence, so the text is carried verbatim once its controls are gone.
 func (m *markdownizer) codeBlock(n *html.Node) {
+	content := strings.Trim(stripControls(preformattedText(n)), "\n")
+	fence := codeFence(content)
+
 	m.flushLine()
 	m.blank()
-	m.write("```" + codeLanguage(n))
+	m.write(fence + fenceInfo(codeLanguage(n)))
 	m.flushLine()
-
-	m.preformatted = true
-	m.children(n)
-	m.preformatted = false
-	m.flushLine()
-
-	m.write("```")
+	for _, line := range strings.Split(content, "\n") {
+		m.rawLine(line)
+	}
+	m.write(fence)
 	m.flushLine()
 	m.blank()
+}
+
+// preformattedText is the text of a <pre>, with a <br> as the newline it stands for.
+func preformattedText(n *html.Node) string {
+	var b strings.Builder
+	var collect func(*html.Node)
+	collect = func(n *html.Node) {
+		switch n.Type { //nolint:exhaustive // only text and element nodes carry content
+		case html.TextNode:
+			b.WriteString(n.Data)
+			return
+		case html.ElementNode:
+			switch n.Data {
+			case "script", "style":
+				return
+			case "br":
+				b.WriteByte('\n')
+				return
+			}
+		}
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			collect(child)
+		}
+	}
+	collect(n)
+	return b.String()
 }
 
 func codeLanguage(n *html.Node) string {
@@ -237,7 +293,7 @@ func tableRows(n *html.Node) [][]string {
 		var cells []string
 		for cell := n.FirstChild; cell != nil; cell = cell.NextSibling {
 			if cell.Type == html.ElementNode && (cell.Data == "td" || cell.Data == "th") {
-				cells = append(cells, strings.ReplaceAll(inlineMarkdown(cell), "|", "\\|"))
+				cells = append(cells, inlineMarkdown(cell))
 			}
 		}
 		if len(cells) > 0 {
@@ -252,11 +308,6 @@ func tableRows(n *html.Node) [][]string {
 }
 
 func (m *markdownizer) emphasis(n *html.Node, delimiter string) {
-	if m.preformatted {
-		m.children(n)
-		return
-	}
-
 	m.inline(n, func(inner string) string {
 		if inner == "" {
 			return ""
@@ -265,16 +316,38 @@ func (m *markdownizer) emphasis(n *html.Node, delimiter string) {
 	})
 }
 
+// code writes inline code. Its text is not prose: nothing in it is Markdown, so
+// nothing in it is escaped, and the delimiters are sized around it.
+func (m *markdownizer) code(n *html.Node) {
+	leading, trailing := surroundingSpace(n)
+	formatted := codeSpan(elementText(n))
+
+	if leading {
+		m.writeSpace()
+	}
+	m.write(formatted)
+	if trailing {
+		m.writeSpace()
+	}
+}
+
+// link writes an anchor. A destination that cannot be linked leaves its text behind as
+// prose, and a label that is itself a URL never hides the destination it points at: the
+// destination is written out beside it, where a reader comparing the two can see both.
 func (m *markdownizer) link(n *html.Node) {
 	href := getAttr(n, "href")
+	dest, linkable := destination(href)
 	m.inline(n, func(text string) string {
 		switch {
-		case href == "":
+		case !linkable:
 			return text
-		case text == "" || text == href:
-			return "<" + href + ">"
+		case text == "" || strings.TrimSpace(elementText(n)) == strings.TrimSpace(href):
+			if absolute(dest) {
+				return "<" + dest + ">"
+			}
+			return "[" + escapeText(dest, m.line.String()) + "](" + dest + ")"
 		default:
-			return "[" + text + "](" + href + ")"
+			return "[" + text + "](" + dest + ")"
 		}
 	})
 }
@@ -325,12 +398,17 @@ func collectText(n *html.Node, b *strings.Builder) {
 	}
 }
 
+// image writes an image, or — when its source may not be linked — its alt text as the
+// prose it then is, escaped against the line it lands on rather than as a label.
 func (m *markdownizer) image(n *html.Node) {
-	src := getAttr(n, "src")
-	if src == "" {
-		return
+	alt := strings.Join(strings.Fields(getAttr(n, "alt")), " ")
+	src, linkable := destination(getAttr(n, "src"))
+	switch {
+	case linkable:
+		m.write("![" + escapeText(alt, "alt") + "](" + src + ")")
+	case alt != "":
+		m.write(escapeText(alt, m.line.String()))
 	}
-	m.write("![" + getAttr(n, "alt") + "](" + src + ")")
 }
 
 func (m *markdownizer) figure(n *html.Node) {
@@ -361,12 +439,14 @@ func (m *markdownizer) embedded(content string) {
 }
 
 func (m *markdownizer) attachment(filename, url, contentType string) {
+	filename = escapeText(strings.Join(strings.Fields(filename), " "), "📎 ")
 	if filename == "" {
 		filename = "attachment"
 	}
+	dest, linkable := destination(url)
 	m.block(func() {
-		if isImageContentType(contentType) && url != "" {
-			m.write("![" + filename + "](" + url + ")")
+		if isImageContentType(contentType) && linkable {
+			m.write("![" + filename + "](" + dest + ")")
 		} else {
 			m.write("📎 " + filename)
 		}
@@ -388,28 +468,18 @@ func (m *markdownizer) block(render func()) {
 }
 
 func (m *markdownizer) write(s string) {
-	m.line += s
+	m.line.WriteString(s)
 }
 
 // writeSpace keeps the single space that separates inline runs without letting
 // the whitespace HTML sprinkles between tags pile up.
 func (m *markdownizer) writeSpace() {
-	if m.line != "" && !strings.HasSuffix(m.line, " ") {
+	if m.line.Len() > 0 && !strings.HasSuffix(m.line.String(), " ") {
 		m.write(" ")
 	}
 }
 
 func (m *markdownizer) writeText(s string) {
-	if m.preformatted {
-		for i, chunk := range strings.Split(s, "\n") {
-			if i > 0 {
-				m.flushLine()
-			}
-			m.write(chunk)
-		}
-		return
-	}
-
 	collapsed := strings.Join(strings.Fields(s), " ")
 	if collapsed == "" || startsWithSpace(s) {
 		m.writeSpace()
@@ -418,10 +488,22 @@ func (m *markdownizer) writeText(s string) {
 		return
 	}
 
-	m.write(collapsed)
+	m.write(escapeText(collapsed, m.line.String()))
 	if endsWithSpace(s) {
 		m.writeSpace()
 	}
+}
+
+// rawLine writes one line of preformatted text as its own line of output, blank lines
+// included: flushLine drops those, and inside a fence they are content.
+func (m *markdownizer) rawLine(line string) {
+	m.write(line)
+	if strings.TrimSpace(line) == "" && m.pendingPrefix == "" {
+		m.lines = append(m.lines, strings.TrimRight(m.prefix, " "))
+		m.line.Reset()
+		return
+	}
+	m.flushLine()
 }
 
 // startsWithSpace and endsWithSpace decode a rune rather than inspect a byte:
@@ -439,14 +521,14 @@ func endsWithSpace(s string) bool {
 }
 
 func (m *markdownizer) hardBreak() {
-	m.breaking = m.line != ""
+	m.breaking = m.line.Len() > 0
 	m.flushLine()
 }
 
 func (m *markdownizer) flushLine() {
-	content := strings.TrimRight(m.line, " \t")
+	content := strings.TrimRight(m.line.String(), " \t")
 	breaking := m.breaking
-	m.line = ""
+	m.line.Reset()
 	m.breaking = false
 	if content == "" && m.pendingPrefix == "" {
 		return

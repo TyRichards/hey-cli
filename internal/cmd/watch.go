@@ -27,6 +27,8 @@ import (
 
 	"github.com/basecamp/hey-cli/internal/apierr"
 	"github.com/basecamp/hey-cli/internal/cable"
+	"github.com/basecamp/hey-cli/internal/output"
+	"github.com/basecamp/hey-cli/internal/terminal"
 )
 
 const changesChannel = "Postings::ChangesChannel"
@@ -622,7 +624,7 @@ func (w *postingsWatch) scriptCommand(ctx context.Context, script string, event 
 }
 
 func (w *postingsWatch) writeJSON(event watchEvent) {
-	payload, err := json.Marshal(event)
+	payload, err := output.MarshalJSON(event)
 	if err != nil {
 		fmt.Fprintf(w.errOut, "warning: could not write a change: %v\n", err)
 		return
@@ -658,10 +660,10 @@ func (e watchEvent) environment() []string {
 func watchLine(event watchEvent) string {
 	description := fmt.Sprintf("posting %d", event.PostingID)
 	if event.Posting != nil {
-		description = fmt.Sprintf("%s — %s (thread %d)", event.Posting.Creator.Name, truncate(event.Posting.Summary, 50), event.ThreadID)
+		description = fmt.Sprintf("%s — %s (thread %d)", terminal.SanitizeLine(event.Posting.Creator.Name), truncate(terminal.SanitizeLine(event.Posting.Summary), 50), event.ThreadID)
 	}
 
-	return fmt.Sprintf("%s  %-8s %-24s %s", event.At, event.Change, event.Box.Name, description)
+	return fmt.Sprintf("%s  %-8s %-24s %s", event.At, event.Change, terminal.SanitizeLine(event.Box.Name), description)
 }
 
 func watchTime(at time.Time) string {

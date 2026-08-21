@@ -801,10 +801,7 @@ func (v *mailView) SubnavItems() ([]navItem, int, string, bool) {
 	}
 	label := "Mail"
 	if v.boxIndex >= 0 && v.boxIndex < len(v.boxes) {
-		label = v.boxes[v.boxIndex].Name
-		if isOrganizedMailSource(v.boxes[v.boxIndex].Kind) {
-			label = terminal.SanitizeLine(label)
-		}
+		label = terminal.SanitizeLine(v.boxes[v.boxIndex].Name)
 		if v.postingPaging.loading {
 			label += " · loading more…"
 		}
@@ -1796,26 +1793,28 @@ func (v *mailView) finishMutation() {
 // the same list as a box's. A match names its own topic, where a posting only carries the
 // URL of one, and the entry that matched is the row's date, excerpt and sender.
 func searchMatchToPosting(match generated.SearchMatch) mail.Posting {
+	// A search match is sanitized here as a posting is in mail.NewPosting: it is a row
+	// in the same list.
 	posting := mail.Posting{
 		ID:        match.PostingId,
 		TopicID:   match.Topic.Id,
-		Name:      match.Topic.Name,
+		Name:      terminal.SanitizeLine(match.Topic.Name),
 		CreatedAt: match.Topic.UpdatedAt,
 		Creator: mail.Contact{
 			ID:           match.Topic.Creator.Id,
-			Name:         match.Topic.Creator.Name,
-			EmailAddress: match.Topic.Creator.EmailAddress,
+			Name:         terminal.SanitizeLine(match.Topic.Creator.Name),
+			EmailAddress: terminal.SanitizeLine(match.Topic.Creator.EmailAddress),
 		},
 	}
 	if len(match.Entries) > 0 {
 		entry := match.Entries[0]
 		posting.CreatedAt = entry.CreatedAt
-		posting.Summary = entry.Summary
-		posting.AlternativeSenderName = entry.AlternativeSenderName
+		posting.Summary = terminal.SanitizeLine(entry.Summary)
+		posting.AlternativeSenderName = terminal.SanitizeLine(entry.AlternativeSenderName)
 		posting.Creator = mail.Contact{
 			ID:           entry.Creator.Id,
-			Name:         entry.Creator.Name,
-			EmailAddress: entry.Creator.EmailAddress,
+			Name:         terminal.SanitizeLine(entry.Creator.Name),
+			EmailAddress: terminal.SanitizeLine(entry.Creator.EmailAddress),
 		}
 	}
 	return posting
@@ -2058,9 +2057,9 @@ func (v *mailView) renderEntries(entries []mail.Entry) string {
 			from = e.AlternativeSenderName
 		}
 
-		fmt.Fprintf(&b, "%s  %s\n", v.vc.styles.entryFrom.Render(from), v.vc.styles.entryDate.Render(formatDisplayDateTime(e.CreatedAt)))
+		fmt.Fprintf(&b, "%s  %s\n", v.vc.styles.entryFrom.Render(terminal.SanitizeLine(from)), v.vc.styles.entryDate.Render(formatDisplayDateTime(e.CreatedAt)))
 		if e.Summary != "" {
-			fmt.Fprintf(&b, "%s\n", e.Summary)
+			fmt.Fprintf(&b, "%s\n", terminal.SanitizeLine(e.Summary))
 		}
 		if e.Body != "" {
 			fmt.Fprintf(&b, "\n%s\n", v.vc.styles.entryBody.Render(markdown.Render(e.Body, sepWidth)))

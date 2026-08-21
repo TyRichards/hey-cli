@@ -157,6 +157,15 @@ func (c *journalReadCommand) run(cmd *cobra.Command, args []string) error {
 		return apierr.FromSDK(err)
 	}
 
+	// --html writes the entry's HTML and, for a day without one, nothing at all.
+	if writer.EffectiveFormat() == output.FormatHTML {
+		if content == "" {
+			return nil
+		}
+		_, err := fmt.Fprintln(cmd.OutOrStdout(), content)
+		return err
+	}
+
 	if content == "" {
 		if writer.IsStyled() {
 			fmt.Fprintf(cmd.OutOrStdout(), "Journal — %s\n\n(empty)\n", date)
@@ -167,11 +176,6 @@ func (c *journalReadCommand) run(cmd *cobra.Command, args []string) error {
 
 	if writer.IsStyled() {
 		w := cmd.OutOrStdout()
-		if htmlOutput {
-			fmt.Fprintln(w, content)
-			return nil
-		}
-
 		fmt.Fprintf(w, "Journal — %s\n\n", date)
 		fmt.Fprintln(w, markdown.Render(htmlutil.ToMarkdown(content), stdoutWidth()))
 		return nil

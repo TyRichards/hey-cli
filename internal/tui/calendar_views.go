@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"charm.land/lipgloss/v2"
+
+	"github.com/basecamp/hey-cli/internal/terminal"
 )
 
 // calendarViewMode represents the calendar display mode.
@@ -291,7 +293,7 @@ func renderDayView(events, todos, habits []Recording, _ time.Time, width, _ int)
 		b.WriteString(muted.Render(strings.Repeat("─", width)))
 		b.WriteString("\n")
 		for _, e := range allDay {
-			title := e.Title
+			title := terminal.SanitizeLine(e.Title)
 			innerLen := gridWidth - 2
 			if len(title) > innerLen {
 				title = truncateStr(title, innerLen)
@@ -324,8 +326,8 @@ func renderDayLane(lane []placedEvent, gridWidth int, primary, muted lipgloss.St
 	// Find the tallest title to determine band height
 	maxTitle := 0
 	for _, pe := range lane {
-		if len([]rune(pe.rec.Title)) > maxTitle {
-			maxTitle = len([]rune(pe.rec.Title))
+		if len([]rune(terminal.SanitizeLine(pe.rec.Title))) > maxTitle {
+			maxTitle = len([]rune(terminal.SanitizeLine(pe.rec.Title)))
 		}
 	}
 	bandHeight := maxTitle + 2 // top border + title rows + bottom border
@@ -345,7 +347,7 @@ func renderDayLane(lane []placedEvent, gridWidth int, primary, muted lipgloss.St
 	for _, pe := range lane {
 		sc, ec := pe.startCol, pe.endCol
 		boxW := ec - sc
-		titleRunes := []rune(pe.rec.Title)
+		titleRunes := []rune(terminal.SanitizeLine(pe.rec.Title))
 
 		// Top border: ┌──┐
 		grid[0][sc] = '┌'
@@ -572,7 +574,7 @@ func buildWeekDayColumn(d weekDayInfo, width int, primary, bright, muted lipglos
 		if h.CompletedAt != "" {
 			marker = "●"
 		}
-		line := marker + " " + truncateStr(h.Title, width-2)
+		line := marker + " " + truncateStr(terminal.SanitizeLine(h.Title), width-2)
 		lines = append(lines, muted.Render(line))
 	}
 
@@ -584,11 +586,11 @@ func buildWeekDayColumn(d weekDayInfo, width int, primary, bright, muted lipglos
 		if timeStr != "" {
 			lines = append(lines, muted.Render(timeStr))
 		}
-		lines = append(lines, bright.Render(truncateStr(e.Title, width)))
+		lines = append(lines, bright.Render(truncateStr(terminal.SanitizeLine(e.Title), width)))
 	}
 
 	for _, e := range d.allDay {
-		lines = append(lines, primary.Render(truncateStr(e.Title, width)))
+		lines = append(lines, primary.Render(truncateStr(terminal.SanitizeLine(e.Title), width)))
 	}
 
 	return lines
@@ -733,7 +735,7 @@ func buildYearDayCell(d time.Time, dayEvents []Recording, colWidth, maxEvents in
 	// Event titles
 	shown := min(len(dayEvents), maxEvents)
 	for i := range shown {
-		title := truncateStr(dayEvents[i].Title, colWidth)
+		title := truncateStr(terminal.SanitizeLine(dayEvents[i].Title), colWidth)
 		lines = append(lines, bright.Render(title))
 	}
 	if len(dayEvents) > maxEvents {
@@ -774,7 +776,7 @@ func renderHabitsRibbon(habits []Recording, width int) string {
 		if h.CompletedAt != "" {
 			marker = "●"
 		}
-		parts = append(parts, marker+" "+h.Title)
+		parts = append(parts, marker+" "+terminal.SanitizeLine(h.Title))
 	}
 	ribbon := strings.Join(parts, "  ")
 	if lipgloss.Width(ribbon) > width {
@@ -794,7 +796,7 @@ func renderTodosRibbon(todos []Recording, width int) string {
 		if t.CompletedAt != "" {
 			marker = "■"
 		}
-		parts = append(parts, marker+" "+t.Title)
+		parts = append(parts, marker+" "+terminal.SanitizeLine(t.Title))
 	}
 	ribbon := strings.Join(parts, "  ")
 	if lipgloss.Width(ribbon) > width {

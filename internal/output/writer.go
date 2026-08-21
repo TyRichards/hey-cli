@@ -28,6 +28,10 @@ const (
 	FormatIDs
 	FormatCount
 	FormatMarkdown
+	// FormatHTML is the raw writer behind --html: the original HTML of the one thing a
+	// command reads, written to a pipe or a file. It carries no envelope, so OK refuses
+	// it; the commands that support it write the HTML themselves.
+	FormatHTML
 )
 
 type Options struct {
@@ -99,6 +103,8 @@ func (w *Writer) OK(data any, opts ...ResponseOption) error {
 		return w.writeCount(data)
 	case FormatMarkdown:
 		return w.writeMarkdown(data)
+	case FormatHTML:
+		return apierr.ErrUsage("--html is not supported by this output")
 	default:
 		return w.writeJSON(data, opts...)
 	}
@@ -125,10 +131,13 @@ func (w *Writer) Err(err error) {
 	e := apierr.AsError(err)
 	format := w.EffectiveFormat()
 
-	if format == FormatStyled {
-		msg := "Error: " + e.Message
+	// An --html run is a person redirecting to a file: the error reads as text on
+	// stderr, as it does on a terminal, rather than as a JSON envelope. Either way the
+	// message and hint may have come from the server, so they are sanitized first.
+	if format == FormatStyled || format == FormatHTML {
+		msg := "Error: " + terminal.Sanitize(e.Message)
 		if e.Hint != "" {
-			msg += "\n" + e.Hint
+			msg += "\n" + terminal.Sanitize(e.Hint)
 		}
 		fmt.Fprintln(w.opts.Stderr, msg)
 		return
@@ -141,9 +150,7 @@ func (w *Writer) Err(err error) {
 		Hint:  e.Hint,
 		Meta:  e.Meta,
 	}
-	enc := json.NewEncoder(w.opts.Stderr)
-	enc.SetIndent("", "  ")
-	_ = enc.Encode(resp)
+	_ = writeIndentedJSON(w.opts.Stderr, resp)
 }
 
 func (w *Writer) writeJSON(data any, opts ...ResponseOption) error {
@@ -151,10 +158,18 @@ func (w *Writer) writeJSON(data any, opts ...ResponseOption) error {
 	for _, opt := range opts {
 		opt(&resp)
 	}
+	return writeIndentedJSON(w.opts.Stdout, resp)
+}
 
-	enc := json.NewEncoder(w.opts.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(resp)
+// writeIndentedJSON writes one value the way json.Encoder would, indented and
+// newline-terminated, with the C1 controls escaped on the way.
+func writeIndentedJSON(out io.Writer, v any) error {
+	data, err := MarshalIndentJSON(v)
+	if err != nil {
+		return err
+	}
+	_, err = out.Write(append(data, '\n'))
+	return err
 }
 
 func (w *Writer) writeJQ(target any) error {
@@ -191,6 +206,10 @@ func (w *Writer) writeJQ(target any) error {
 	}
 }
 
+// writeJQResult writes one jq result. A string result is written raw, as `jq -r`
+// writes it: on a terminal it is sanitized first, and on a pipe it is the value
+// itself, control characters included, because the bytes are the value and the
+// consumer is a program. Anything else is JSON, with the C1 controls escaped.
 func (w *Writer) writeJQResult(result any, tty bool) error {
 	if tty {
 		result = sanitizeJSONValue(result)
@@ -200,12 +219,10 @@ func (w *Writer) writeJQResult(result any, tty bool) error {
 		return err
 	}
 
-	raw, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
+	if err := writeIndentedJSON(w.opts.Stdout, result); err != nil {
 		return ErrJQRuntime(fmt.Errorf("encode result: %w", err))
 	}
-	_, err = fmt.Fprintln(w.opts.Stdout, string(raw))
-	return err
+	return nil
 }
 
 func compileJQ(filter string) (*gojq.Code, error) {
@@ -271,9 +288,7 @@ func sanitizeJSONMap(value map[string]any) map[string]any {
 }
 
 func (w *Writer) writeQuiet(data any) error {
-	enc := json.NewEncoder(w.opts.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(data)
+	return writeIndentedJSON(w.opts.Stdout, data)
 }
 
 func (w *Writer) writeIDs(data any) error {
