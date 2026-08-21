@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -186,6 +187,16 @@ func cliEnv() []string {
 // ---------------------------------------------------------------------------
 // Setup helpers
 // ---------------------------------------------------------------------------
+
+// skipf skips a test the server cannot support — or fails it, under HEY_SMOKE_STRICT=1,
+// where a check that did not run is not a check that passed.
+func skipf(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if strict, _ := strconv.ParseBool(os.Getenv("HEY_SMOKE_STRICT")); strict {
+		t.Fatalf("strict: "+format, args...)
+	}
+	t.Skipf(format, args...)
+}
 
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
