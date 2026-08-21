@@ -92,6 +92,47 @@ func TestToMarkdownTable(t *testing.T) {
 	}
 }
 
+func TestToMarkdownLayoutTable(t *testing.T) {
+	got := ToMarkdown(`<table><tr><td>
+		<table><tr><td><p>Hi Stanko,</p></td></tr></table>
+		<table><tr><td><p>We've detected an unusual sign-in.</p></td></tr></table>
+	</td></tr></table>`)
+	want := "Hi Stanko,\n\nWe've detected an unusual sign-in."
+	if got != want {
+		t.Errorf("ToMarkdown = %q, want %q", got, want)
+	}
+}
+
+func TestToMarkdownGridInsideLayoutTable(t *testing.T) {
+	got := ToMarkdown(`<table><tr><td>
+		<p>When and where this happened</p>
+		<table>
+			<tr><td>Date</td><td>Aug 20 2026 at 07:04:42 PM UTC</td></tr>
+			<tr><td>Location</td><td>HR</td></tr>
+		</table>
+	</td></tr></table>`)
+	want := "When and where this happened\n\n| Date | Aug 20 2026 at 07:04:42 PM UTC |\n| --- | --- |\n| Location | HR |"
+	if got != want {
+		t.Errorf("ToMarkdown = %q, want %q", got, want)
+	}
+}
+
+func TestToMarkdownSingleColumnTable(t *testing.T) {
+	got := ToMarkdown("<table><tr><td><p>Need some help?</p></td></tr><tr><td><p>Hit reply.</p></td></tr></table>")
+	want := "Need some help?\n\nHit reply."
+	if got != want {
+		t.Errorf("ToMarkdown = %q, want %q", got, want)
+	}
+}
+
+func TestToMarkdownRaggedTable(t *testing.T) {
+	got := ToMarkdown("<table><tr><td>Plan</td><td>Price</td></tr><tr><td>Everything</td></tr></table>")
+	want := "Plan\n\nPrice\n\nEverything"
+	if got != want {
+		t.Errorf("ToMarkdown = %q, want %q", got, want)
+	}
+}
+
 func TestToMarkdownHardBreak(t *testing.T) {
 	got := ToMarkdown("<p>Thanks,<br>Jason</p>")
 	want := "Thanks,  \nJason"

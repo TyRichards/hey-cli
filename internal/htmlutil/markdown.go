@@ -75,7 +75,7 @@ func (m *markdownizer) element(n *html.Node) {
 		m.block(func() { m.write("---") })
 	case "h1", "h2", "h3", "h4", "h5", "h6":
 		m.heading(n)
-	case "p", "div", "section", "article", "header", "footer", "tbody", "thead":
+	case "p", "div", "section", "article", "header", "footer", "tbody", "thead", "tr", "td", "th":
 		m.block(func() { m.children(n) })
 	case "blockquote":
 		m.blockquote(n)
@@ -211,7 +211,8 @@ func codeLanguage(n *html.Node) string {
 
 func (m *markdownizer) table(n *html.Node) {
 	rows := tableRows(n)
-	if len(rows) == 0 {
+	if !isGrid(n, rows) {
+		m.block(func() { m.children(n) })
 		return
 	}
 
@@ -222,13 +223,39 @@ func (m *markdownizer) table(n *html.Node) {
 	m.write("|" + strings.Repeat(" --- |", len(rows[0])))
 	m.flushLine()
 	for _, row := range rows[1:] {
-		for len(row) < len(rows[0]) {
-			row = append(row, "")
-		}
-		m.write("| " + strings.Join(row[:len(rows[0])], " | ") + " |")
+		m.write("| " + strings.Join(row, " | ") + " |")
 		m.flushLine()
 	}
 	m.blank()
+}
+
+// isGrid tells a table that holds data from a table that holds a layout. Email
+// is built out of the latter, nested several deep, and rendering one as a
+// Markdown table smears the whole message into a single unreadable row. A real
+// grid has at least two rows and columns, the same number of cells in every
+// row, and no table of its own inside.
+func isGrid(n *html.Node, rows [][]string) bool {
+	if len(rows) < 2 || len(rows[0]) < 2 || containsTable(n) {
+		return false
+	}
+	for _, row := range rows {
+		if len(row) != len(rows[0]) {
+			return false
+		}
+	}
+	return true
+}
+
+func containsTable(n *html.Node) bool {
+	for child := n.FirstChild; child != nil; child = child.NextSibling {
+		if child.Type == html.ElementNode && child.Data == "table" {
+			return true
+		}
+		if containsTable(child) {
+			return true
+		}
+	}
+	return false
 }
 
 func tableRows(n *html.Node) [][]string {

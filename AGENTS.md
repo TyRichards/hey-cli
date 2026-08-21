@@ -91,6 +91,14 @@ costs formatting rather than the message.
 `ToText` is still right where the result is not shown to anyone — the name tag
 `hey bulk-reply` reads out of a draft, for instance.
 
+#### Most tables in email are not tables
+
+A marketing email is a stack of nested `<table>`s used for layout, and rendering those as
+Markdown tables collapses the entire message into one row of escaped pipes. `isGrid` in
+`markdown.go` keeps the two apart: a table becomes a Markdown table only if it has two or
+more rows, two or more columns, the same cell count in every row, and no table inside it.
+Everything else flows as blocks, one per row and cell, which is how the web app reads.
+
 #### Inbound email hides its body in an attachment
 
 `/messages/{id}` serves `content` through haystack's `trix_html_for_rich_text_editing`,
