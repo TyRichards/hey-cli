@@ -215,6 +215,51 @@ func TestToMarkdownInlineCodeSizesItsDelimiters(t *testing.T) {
 // sanitizer drops a zero width space between two runs of backticks, joining them, so
 // the delimiter must be longer than the joined run or the code could be closed from
 // inside by text that only looks shorter.
+// Prose is written in the form the renderer's sanitizer leaves it in, so a character it
+// strips cannot hide a block marker from the line-start escape: "\u200b# heading" is a
+// heading to glamour once the zero width space is gone, unless the hash was escaped.
+func TestToMarkdownEscapesWhatTheSanitizerUncovers(t *testing.T) {
+	for _, test := range []struct{ in, want string }{
+		{"<p>\u200b# heading</p>", "\\# heading"},
+		{"<p>1\u200b. item</p>", "1\\. item"},
+		{"<p>\u00ad- item</p>", "\\- item"},
+		{"<p>\u202e> quoted</p>", "\\> quoted"},
+		{"<p>\x1b[31m# red</p>", "\\# red"},
+		{"<p>\u200b # heading</p>", "\\# heading"},
+		{"<p>\u200b \u200b \u200b \u200b code?</p>", "code?"},
+		{"<p>\u200b \u200b \u200b \u200b 1. item</p>", "1\\. item"},
+		{"<p>a \u200b b</p>", "a b"},
+		{"<p>a<span>\u200b b</span></p>", "a b"},
+		{"<p>a <span>\u200b b</span></p>", "a b"},
+	} {
+		if got := toMarkdown(test.in); got != test.want {
+			t.Errorf("ToMarkdown(%q) = %q, want %q", test.in, got, test.want)
+		}
+	}
+}
+
+// Prose is sanitized in the context of the line it joins, so a joining sequence or a
+// stack of marks that HTML splits across two text nodes is judged on the text rather
+// than on the node boundary; a joiner at the end of a line is dropped as the renderer
+// would drop it.
+func TestToMarkdownSanitizesProseAcrossTextNodes(t *testing.T) {
+	for _, test := range []struct{ in, want string }{
+		{"<p>👨<span>\u200d👩</span></p>", "👨\u200d👩"},
+		{"<p>👨<span>\u200d</span><span>👩</span></p>", "👨\u200d👩"},
+		{"<p>क्<span>\u200dष</span></p>", "क्\u200dष"},
+		{"<p>a<span>\u200dé</span></p>", "aé"},
+		{"<p>e\u0301\u0301\u0301\u0301<span>\u0301\u0301\u0301\u0301\u0301</span></p>", "e" + strings.Repeat("\u0301", 8)},
+		{"<p>می\u200c<!--comment-->خواهم</p>", "می\u200cخواهم"},
+		{"<p>می\u200c<wbr>خواهم</p>", "می\u200cخواهم"},
+		{"<p>👨\u200d</p>", "👨"},
+		{"<p>👨<b>\u200d👩</b></p>", "👨**👩**"},
+	} {
+		if got := toMarkdown(test.in); got != test.want {
+			t.Errorf("ToMarkdown(%q) = %q, want %q", test.in, got, test.want)
+		}
+	}
+}
+
 func TestToMarkdownCodeDelimitersOutlastTheSanitizer(t *testing.T) {
 	for _, test := range []struct{ in, want string }{
 		{"<p><code>``\u200b``</code></p>", "````` ``\u200b`` `````"},

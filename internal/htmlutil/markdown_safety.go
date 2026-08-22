@@ -3,6 +3,8 @@ package htmlutil
 import (
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/basecamp/hey-cli/internal/terminal"
 )
@@ -13,7 +15,12 @@ import (
 // own grammar, so each has its own serializer here, and the invariant every one of them
 // keeps is the same: the Markdown parses back to the literal text or URL it was given,
 // with no control character left in it. The text that reads "&#27;[31m" in an email stays
-// those eight characters on screen rather than turning red.
+// those eight characters on screen rather than turning red. Prose is the one context
+// written in its sanitized form — terminal.Sanitize runs over it before anything is
+// escaped — because markdown.Render runs that sanitizer over the whole body before
+// parsing it, and an escape decided on the text as written can be undone by what the
+// sanitizer removes in front of it. Code and destinations are written as they are and
+// only measured through the sanitizer; the HTML keeps the original of everything.
 
 // inlineMetacharacters are the ASCII characters that open Markdown syntax wherever they
 // stand in a line. `&` is not among them because it is written as an entity instead.
@@ -27,10 +34,14 @@ const lineStartMetacharacters = "#>+-="
 // CommonMark decodes anywhere outside code — text, link destinations, info strings.
 var entityReference = regexp.MustCompile(`^&(#[0-9]{1,8}|#[xX][0-9a-fA-F]{1,8}|[A-Za-z][A-Za-z0-9]{1,31});`)
 
-// escapeText serializes a run of prose onto a line that already holds `line`. Controls go
-// first, so that what is left is what gets looked at — "&\x1f#27;" is "&#27;" once the
-// control is gone. Then every metacharacter is backslash-escaped, and at the start of a
-// line so is anything that would begin a block.
+// escapeText serializes a run of prose onto a line that already holds `line`. The
+// sanitizer goes first, so that what is left is what gets looked at — "&\x1f#27;" is
+// "&#27;" once the control is gone, and "\u200b# heading" is "# heading" once the zero
+// width space is. markdown.Render runs the same sanitizer over the whole body before
+// parsing it, so prose is written here in the form it will be parsed in; escaping the
+// text as written and letting the renderer strip an invisible in front of a block marker
+// would hand glamour a heading the email never had. Then every metacharacter is
+// backslash-escaped, and at the start of a line so is anything that would begin a block.
 //
 // Every `&` becomes `&amp;`, which decodes back to `&` in CommonMark and in glamour
 // alike. Escaping only the ampersands that already spell an entity is not enough: text
@@ -38,12 +49,7 @@ var entityReference = regexp.MustCompile(`^&(#[0-9]{1,8}|#[xX][0-9a-fA-F]{1,8}|[
 // start of the next is an entity once they sit side by side. For the same reason the
 // line-start checks look at the line being built rather than at the run alone.
 func escapeText(s, line string) string {
-	s = strings.Map(func(r rune) rune {
-		if isControl(r) {
-			return -1
-		}
-		return r
-	}, s)
+	s = sanitizeProse(s, line)
 
 	var b strings.Builder
 	b.Grow(len(s))
@@ -60,6 +66,88 @@ func escapeText(s, line string) string {
 		b.WriteRune(r)
 	}
 	return b.String()
+}
+
+// sanitizeProse runs terminal.Sanitize over a run of prose the way the renderer will: in
+// the context of the line it joins. Text arrives a node at a time, and HTML can split a
+// joining sequence or a stack of marks across two of them — "👨<span>\u200d👩</span>"
+// — where a run sanitized on its own would lose the joiner for want of a base on its
+// left, and a ninth mark would pass for a first. The context is the last base on the
+// line and what rides on it (lineContext), which is all the sanitizer's decisions look
+// back at. A joiner a run ends with is kept: what follows is not known yet, the next run
+// is judged with it in its context, and one left dangling at the end of a line is
+// trimmed there (flushLine), as the renderer would trim it anyway.
+func sanitizeProse(s, line string) string {
+	s = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return -1
+		}
+		return r
+	}, s)
+	context := lineContext(line)
+	whole := terminal.Sanitize(context + s)
+	var tail string
+	switch head := terminal.Sanitize(context); {
+	case strings.HasPrefix(whole, context):
+		// The context as written, a joiner kept at its end included, stands.
+		tail = whole[len(context):]
+	case strings.HasPrefix(whole, head):
+		// A joiner kept at the end of the line found nothing to join; it stays on
+		// the line as the renderer's pass will see and drop it.
+		tail = whole[len(head):]
+	default:
+		return terminal.Sanitize(s)
+	}
+	// A trailing joiner that went for want of a right-hand side is kept for the next
+	// run, but only one a base would have taken: the probe asks the sanitizer itself.
+	if last, _ := utf8.DecodeLastRuneInString(s); isJoiner(last) && !strings.HasSuffix(tail, string(last)) &&
+		strings.HasSuffix(terminal.Sanitize(context+tail+string(last)+"é"), string(last)+"é") {
+		tail += string(last)
+	}
+	return recollapse(tail, line)
+}
+
+// recollapse folds the whitespace the sanitizer uncovered — "\u200b # heading" is
+// " # heading" once the zero width space is gone — the way writeText folded the run
+// before it: runs of whitespace to one space, none at the start of a line, so that a
+// block marker cannot hide behind a space the line-start escape does not look past, and
+// four of them cannot open an indented code block. A space at either edge of the run
+// stays one space between it and its neighbours, as writeSpace would have left it.
+func recollapse(s, line string) string {
+	folded := strings.Join(strings.Fields(s), " ")
+	if folded == "" {
+		return ""
+	}
+	if startsWithSpace(s) && line != "" && !strings.HasSuffix(line, " ") {
+		folded = " " + folded
+	}
+	if endsWithSpace(s) {
+		folded += " "
+	}
+	return folded
+}
+
+// lineContext is the end of a line that the sanitizer's decisions about what follows
+// look back at: the last rune that is neither a mark nor a joiner, and everything after
+// it. It is bounded, since a line can be long and the context cannot be — the sanitizer
+// keeps at most a handful of marks on a base.
+func lineContext(line string) string {
+	const maxContextRunes = 32
+	end := len(line)
+	for i := 0; i < maxContextRunes && end > 0; i++ {
+		r, size := utf8.DecodeLastRuneInString(line[:end])
+		end -= size
+		if !isCombiningMark(r) && !isJoiner(r) {
+			break
+		}
+	}
+	return line[end:]
+}
+
+func isJoiner(r rune) bool { return r == 0x200c || r == 0x200d }
+
+func isCombiningMark(r rune) bool {
+	return r >= 0x300 && unicode.In(r, unicode.Mn, unicode.Me, unicode.Mc)
 }
 
 // closesOrderedMarker reports whether the line so far — what was already on it and the
