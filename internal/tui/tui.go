@@ -30,14 +30,15 @@ type spinnerTickMsg struct{}
 // --- Model ---
 
 type model struct {
-	width   int
-	height  int
-	vc      *viewContext
-	rootSDK *hey.Client
-	cancel  context.CancelFunc
-	theme   Theme
-	styles  styles
-	help    helpBar
+	width          int
+	height         int
+	vc             *viewContext
+	rootSDK        *hey.Client
+	cancel         context.CancelFunc
+	theme          Theme
+	styles         styles
+	help           helpBar
+	saveHelpHidden func(bool) error
 
 	// Navigation
 	section    section
@@ -229,12 +230,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.vc.width = msg.Width
-		contentH := msg.Height - headerHeight - m.help.height() - 3
-		if contentH < 1 {
-			contentH = 1
-		}
-		m.vc.height = contentH
 		m.help.setWidth(msg.Width)
+		contentH := m.contentHeight()
+		m.vc.height = contentH
 		m.activeView.Resize(msg.Width, contentH)
 		m.updateHelpBindings()
 		return m, nil
@@ -444,7 +442,7 @@ func (m model) applyMailAccount(account mailAccountChoice, client *hey.Client) (
 	m.cancel = cancel
 	m.vc = newViewContext(ctx, m.rootSDK, client, m.styles)
 	m.vc.width = m.width
-	m.vc.height = max(m.height-headerHeight-m.help.height()-3, 1)
+	m.vc.height = m.contentHeight()
 	m.mailView = newMailView(m.vc)
 	m.contactsView = newContactsView(m.vc)
 	m.calendarView = newCalendarView(m.vc)
@@ -475,7 +473,7 @@ func (m model) applyMailAccount(account mailAccountChoice, client *hey.Client) (
 
 // --- View ---
 
-const headerHeight = 6
+const headerHeight = 6 // five drawn rows and the terminal's final safety row
 
 func (m model) View() tea.View {
 	var b strings.Builder
@@ -488,29 +486,22 @@ func (m model) View() tea.View {
 	} else if m.err != nil {
 		b.WriteString(errorView(m.err.Error(), m.width))
 	} else if m.loading {
-		contentH := m.height - headerHeight - m.help.height() - 3
-		if contentH < 1 {
-			contentH = 1
-		}
-		b.WriteString(loadingView(m.width, contentH, m.spinnerPhase))
+		b.WriteString(loadingView(m.width, m.contentHeight(), m.spinnerPhase))
 	} else {
 		b.WriteString(m.activeView.View())
 	}
 
-	contentLines := strings.Count(b.String(), "\n")
 	helpView := m.help.view()
-	helpH := 0
 	if helpView != "" {
-		helpH = strings.Count(helpView, "\n") + 1
-	}
-	footerH := 1 + helpH
-	padLines := m.height - contentLines - footerH - 1
-	for range max(padLines, 0) {
-		b.WriteString("\n")
-	}
+		contentLines := strings.Count(b.String(), "\n")
+		helpH := strings.Count(helpView, "\n") + 1
+		footerH := 1 + helpH
+		padLines := m.height - contentLines - footerH - 1
+		for range max(padLines, 0) {
+			b.WriteString("\n")
+		}
 
-	b.WriteString(renderRule(m.width, ""))
-	if helpView != "" {
+		b.WriteString(renderRule(m.width, ""))
 		b.WriteString("\n" + helpView)
 	}
 
@@ -574,6 +565,9 @@ func (m *model) updateHelpBindings() {
 			bindings = append(bindings, extra...)
 		}
 	}
+	if m.canToggleHelp() && !m.help.hidden {
+		bindings = append(bindings, helpBinding{"?", "hide help"})
+	}
 	if m.canOpenMailAccountPicker() && !m.mailAccountPicker {
 		if ic, ok := m.activeView.(inputCapturer); !ok || !ic.CapturingInput() {
 			description := "mail account"
@@ -584,20 +578,32 @@ func (m *model) updateHelpBindings() {
 		}
 	}
 	m.help.setBindings(bindings)
-	contentHeight := m.height - headerHeight - m.help.height() - 3
-	if contentHeight < 1 {
-		contentHeight = 1
-	}
+	contentHeight := m.contentHeight()
 	if contentHeight != m.vc.height {
 		m.vc.height = contentHeight
 		m.activeView.Resize(m.vc.width, contentHeight)
 	}
 }
 
+// contentHeight gives the active view every row that is not navigation or a
+// visible help footer. The footer carries two clear rows above its divider.
+func (m model) contentHeight() int {
+	footerHeight := 0
+	if helpHeight := m.help.height(); helpHeight > 0 {
+		footerHeight = helpHeight + 3
+	}
+	return max(m.height-headerHeight-footerHeight, 1)
+}
+
 // --- Key handling ---
 
 func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
+
+	if m.help.notice != "" {
+		m.help.setNotice("")
+		m.updateHelpBindings()
+	}
 
 	if key == "ctrl+c" {
 		if m.ctrlCOnce {
@@ -616,6 +622,10 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	if m.mailAccountPicker {
 		return m.handleMailAccountKey(msg)
+	}
+
+	if key == "?" && m.canToggleHelp() {
+		return m.toggleHelp()
 	}
 
 	// A view with an open text form gets every key (esc, tab, letters, ...).
@@ -706,6 +716,29 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	return m, nil
+}
+
+func (m model) canToggleHelp() bool {
+	if m.mailAccountPicker {
+		return false
+	}
+	if m.activeView == m.screenerView {
+		return true
+	}
+	capturer, ok := m.activeView.(inputCapturer)
+	return !ok || !capturer.CapturingInput()
+}
+
+func (m model) toggleHelp() (tea.Model, tea.Cmd) {
+	hidden := !m.help.hidden
+	m.help.setHidden(hidden)
+	if m.saveHelpHidden != nil {
+		if err := m.saveHelpHidden(hidden); err != nil {
+			m.help.setNotice(errorNotice("Could not save the help preference", err))
+		}
+	}
+	m.updateHelpBindings()
 	return m, nil
 }
 
@@ -910,7 +943,10 @@ func formatTimestamp(ts time.Time) string {
 // Run starts the TUI with the resolved mail account, the identity root client used for
 // interactive account switching, and the watchers that tell it when things changed.
 func Run(rootSDK, sdk *hey.Client, selected string, watchers Watchers) error {
-	p := tea.NewProgram(newModelWithMailAccounts(rootSDK, sdk, selected, watchers))
+	m := newModelWithMailAccounts(rootSDK, sdk, selected, watchers)
+	m.help.setHidden(config.HelpHidden())
+	m.saveHelpHidden = config.SaveHelpHidden
+	p := tea.NewProgram(m)
 	_, err := p.Run()
 	return err
 }
