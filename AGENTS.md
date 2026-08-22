@@ -546,7 +546,32 @@ makes a reconnect safe: the cursor, not the notification, is the source of truth
 missed broadcast costs nothing, and a 409 means catch up in full instead. A read that
 fails leaves the cursor where it was and is retried on a doubling backoff, so a change
 isn't lost with the notification that announced it, and a subscription that closes without
-the watch being interrupted is an error rather than a quiet exit.
+the watch being interrupted is an error rather than a quiet exit. `ready` waits for that
+retry too (`catchUp`/`retryUnread`/`readyOnceCaughtUp`): a catch-up that left a box behind
+owes its ready until the box is read, and a drop in between cancels the debt — the
+reconnect's catch-up announces its own. The look at the transition queue and the ready
+announcement are one critical section with `noteConnection`'s queueing, which is what keeps
+a drop from landing between them.
+
+New mail is a watch event, not a flag: every added and updated line carries `"new":
+true|false` and `--events new` selects the true ones (`internal/cmd/watch_new.go`). New is
+unseen, not muted, and `active_at` later than the watch's record of the thread — or than
+the watch's start, on HEY's clock (`serverNow`), for a thread it has no record of — and
+every posting the watch reads is recorded, in every box and whatever `--events` or `--box`
+says (`--box` picks the boxes whose changes are reported; every box is followed), each
+posting recorded as soon as it is classified. The
+start is the Date header translated back to when the request was made (mail that lands while
+the server answers is later than the start), it is taken before the box list, and each
+box's cursor starts no later than it (`noLaterThan`): the server bakes the box's last posting
+activity into the cursor, so mail that landed in between would otherwise sit behind the
+cursor, read by nothing. That
+is HEY's semantics and state across events, so the CLI decides it once; what to do about
+it is the reader's. A 409 skip-ahead sets that box's floor at the cursor it skipped to
+(`newMail.skippedTo`): activity at or before it is never new there, known thread or not,
+because the watch never read the gap. `resync` is an event of its own — reported by default,
+left out by `--events new` — so a script for new mail never runs on one. The Omarchy bar plugin toasts from those lines itself (app-name, glyph,
+click-to-focus and the replace-not-stack id all live in the plugin), and nothing
+desktop-shaped lives in `watch*.go`.
 
 The TUI's mail list follows the same channel and wants less from it. `internal/cmd/tui_watch.go`
 subscribes and relays the changed box IDs down a channel; `internal/tui/live.go` defines

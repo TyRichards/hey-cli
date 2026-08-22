@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	actioncable "github.com/basecamp/actioncable-go"
 
@@ -24,8 +26,8 @@ func TestWatchedChanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !changes["added"] || !changes["updated"] || !changes["deleted"] {
-		t.Errorf("changes = %v, want every change by default", changes)
+	if !changes["added"] || !changes["updated"] || !changes["deleted"] || !changes["resync"] || changes["new"] {
+		t.Errorf("changes = %v, want every change and resync by default, and new only when asked", changes)
 	}
 
 	command.events = []string{"Added", " deleted"}
@@ -35,6 +37,15 @@ func TestWatchedChanges(t *testing.T) {
 	}
 	if !changes["added"] || !changes["deleted"] || changes["updated"] {
 		t.Errorf("changes = %v, want added and deleted only", changes)
+	}
+
+	command.events = []string{"new"}
+	changes, err = command.watchedChanges()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !changes["new"] || changes["added"] || changes["updated"] || changes["deleted"] || changes["resync"] {
+		t.Errorf("changes = %v, want new mail alone — not a resync", changes)
 	}
 
 	command.events = []string{"moved"}
@@ -135,13 +146,14 @@ func newTestWatch(changes ...string) (*postingsWatch, *bytes.Buffer) {
 
 	out := &bytes.Buffer{}
 	return &postingsWatch{
-		boxes:   map[int64]*watchedBox{24088: {id: 24088, kind: "imbox", name: "Imbox"}},
-		changes: watched,
-		out:     out,
-		errOut:  &bytes.Buffer{},
-		catchUp: make(chan struct{}, 1),
-		unread:  map[int64]bool{},
-		running: make(chan struct{}, asyncScriptLimit),
+		boxes:      map[int64]*watchedBox{24088: {id: 24088, kind: "imbox", name: "Imbox", reported: true}},
+		changes:    watched,
+		newMail:    trackNewMail(watchStarted),
+		out:        out,
+		errOut:     &bytes.Buffer{},
+		connection: make(chan struct{}, 1),
+		unread:     map[int64]bool{},
+		running:    make(chan struct{}, asyncScriptLimit),
 	}, out
 }
 
@@ -149,7 +161,7 @@ func TestWatchReportsJSONPerPosting(t *testing.T) {
 	watch, out := newTestWatch("added", "updated", "deleted")
 	posting := &generated.Posting{Id: 9001, AppUrl: "https://app.hey.com/topics/5511"}
 
-	watch.report(context.Background(), watchEvent{Change: "added", At: "2026-08-18T09:14:22.031Z", PostingID: 9001}, watch.boxes[24088], posting)
+	watch.report(context.Background(), watchEvent{Change: "added", At: "2026-08-18T09:14:22.031Z", PostingID: 9001, New: watch.classify(watch.boxes[24088], *posting)}, watch.boxes[24088], posting)
 	watch.report(context.Background(), watchEvent{Change: "deleted", At: "2026-08-18T09:15:00.000Z", PostingID: 9003}, watch.boxes[24088], nil)
 
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
@@ -170,6 +182,9 @@ func TestWatchReportsJSONPerPosting(t *testing.T) {
 	if added.Posting == nil {
 		t.Error("an added posting should carry the posting itself")
 	}
+	if added.New == nil || *added.New {
+		t.Errorf("new = %v, want false for a posting active before the watch began", added.New)
+	}
 
 	var deleted watchEvent
 	if err := json.Unmarshal([]byte(lines[1]), &deleted); err != nil {
@@ -180,6 +195,9 @@ func TestWatchReportsJSONPerPosting(t *testing.T) {
 	}
 	if deleted.ThreadID != 0 {
 		t.Errorf("thread = %d, want none for a deleted posting", deleted.ThreadID)
+	}
+	if strings.Contains(lines[1], `"new"`) {
+		t.Errorf("deleted = %s, want no new: a deletion is not mail", lines[1])
 	}
 }
 
@@ -243,7 +261,7 @@ func TestWatchEventEnvironment(t *testing.T) {
 	event := watchEvent{
 		Change:    "added",
 		At:        "2026-08-18T09:14:22.031Z",
-		Box:       watchEventBox{ID: 24088, Kind: "imbox", Name: "Imbox"},
+		Box:       &watchEventBox{ID: 24088, Kind: "imbox", Name: "Imbox"},
 		PostingID: 9001,
 		ThreadID:  5511,
 	}
@@ -253,6 +271,15 @@ func TestWatchEventEnvironment(t *testing.T) {
 		if !strings.Contains(environment, want) {
 			t.Errorf("environment = %q, want %s", environment, want)
 		}
+	}
+	if !strings.Contains(environment, "HEY_NEW=0") {
+		t.Errorf("environment = %q, want HEY_NEW=0 when the posting is not new", environment)
+	}
+
+	isNew := true
+	event.New = &isNew
+	if environment := strings.Join(event.environment(), "\n"); !strings.Contains(environment, "HEY_NEW=1") {
+		t.Errorf("environment = %q, want HEY_NEW=1 for new mail", environment)
 	}
 }
 
@@ -426,6 +453,192 @@ func TestWatchSkipsAheadToTheBoxesOwnCursor(t *testing.T) {
 	if got := watch.boxes[24088].cursor.Since; got != "2026-08-21T11:02:00.000Z" {
 		t.Errorf("cursor = %q, want the server's current one", got)
 	}
+	if got := watch.newMail.floors[24088]; !got.Equal(time.Date(2026, 8, 21, 11, 2, 0, 0, time.UTC)) {
+		t.Errorf("new-mail floor = %v, want the box's floor at the cursor it skipped to", got)
+	}
+}
+
+func TestWatchReadyWaitsForAFailedCatchUpRead(t *testing.T) {
+	t.Setenv("HEY_TOKEN", "test-token")
+	broken := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if broken {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Link", `<`+r.URL.Path+`?since=2026-08-18T09%3A14%3A22.031Z&v=2>; rel="next"`)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	initSDK(auth.NewManager(server.URL, server.Client(), t.TempDir()), server.URL)
+
+	watch, out := newTestWatch("added")
+	cursor, err := watchCursor(server.URL+"/boxes/24088/postings/changes.json?since=2026-08-18T09%3A00%3A00.000Z&v=2", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	watch.boxes[24088].cursor = cursor
+
+	// The catch-up's read fails: the box waits for its retry, and so does ready.
+	if err := watch.catchUp(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("wrote %q, want no ready while a box is still behind", out.String())
+	}
+	if !watch.catchingUp || !watch.unread[24088] {
+		t.Fatalf("catchingUp = %v, unread = %v; want the ready owed and the box waiting", watch.catchingUp, watch.unread)
+	}
+
+	// The retry reads it: now ready.
+	broken = false
+	if err := watch.retryUnread(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out.String(), `"change":"ready"`) || watch.catchingUp {
+		t.Errorf("wrote %q, want ready once the last box is read", out.String())
+	}
+
+	// A later retry with nothing owed announces nothing.
+	out.Reset()
+	if err := watch.retryUnread(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("wrote %q, want no ready when none is owed", out.String())
+	}
+}
+
+func TestWatchScriptDoesNotInheritAnotherEventsVariables(t *testing.T) {
+	t.Setenv("HEY_NEW", "1")
+	t.Setenv("HEY_THREAD_ID", "5511")
+	t.Setenv("HEY_TOKEN", "kept")
+	watch, out := newTestWatch("deleted")
+	watch.syncScript = `printf "%s %s %s\n" "${HEY_NEW:-unset}" "${HEY_THREAD_ID:-unset}" "$HEY_TOKEN"`
+
+	watch.report(context.Background(), watchEvent{Change: "deleted", PostingID: 9003}, watch.boxes[24088], nil)
+
+	if got := out.String(); got != "0 unset kept\n" {
+		t.Errorf("script saw %q, want HEY_NEW=0 and no inherited thread id, and everything else kept", got)
+	}
+}
+
+func TestWatchReadyYieldsToADropQueuedDuringTheCatchUp(t *testing.T) {
+	server := changesServer(t, `{}`)
+	watch, out := newTestWatch("added")
+	cursor, err := watchCursor(server.URL+"/boxes/24088/postings/changes.json?since=2026-08-21T09%3A00%3A00.000Z&v=2", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	watch.boxes[24088].cursor = cursor
+
+	// The connection dropped while the catch-up was reading: the drop is
+	// queued, not yet acted on, and ready must not get ahead of it.
+	watch.noteConnection(false)
+	if err := watch.catchUp(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("wrote %q, want no ready with a drop waiting", out.String())
+	}
+
+	// The drop and the reconnect drain in order: disconnected, then the
+	// reconnect's own catch-up and ready.
+	watch.noteConnection(true)
+	if err := watch.followConnection(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], `"change":"disconnected"`) || !strings.Contains(lines[1], `"change":"ready"`) {
+		t.Errorf("wrote %q, want disconnected then ready", lines)
+	}
+}
+
+func TestWatchDoorbellReadPaysTheReadyACatchUpOwed(t *testing.T) {
+	t.Setenv("HEY_TOKEN", "test-token")
+	broken := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if broken {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Link", `<`+r.URL.Path+`?since=2026-08-18T09%3A14%3A22.031Z&v=2>; rel="next"`)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	initSDK(auth.NewManager(server.URL, server.Client(), t.TempDir()), server.URL)
+
+	watch, out := newTestWatch("added")
+	cursor, err := watchCursor(server.URL+"/boxes/24088/postings/changes.json?since=2026-08-18T09%3A00%3A00.000Z&v=2", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	watch.boxes[24088].cursor = cursor
+	if err := watch.catchUp(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The box rings before its retry comes round, and the read works: ready
+	// now, not two minutes from now.
+	broken = false
+	if err := watch.read(context.Background(), actioncable.Message(`{"change":"upsert","box_id":24088}`)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out.String(), `"change":"ready"`) || watch.catchingUp {
+		t.Errorf("wrote %q, want ready once the doorbell read caught the box up", out.String())
+	}
+}
+
+func TestWatchDropWhileCatchingUpCancelsTheReadyItOwed(t *testing.T) {
+	t.Setenv("HEY_TOKEN", "test-token")
+	broken := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if broken {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Link", `<`+r.URL.Path+`?since=2026-08-18T09%3A14%3A22.031Z&v=2>; rel="next"`)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	initSDK(auth.NewManager(server.URL, server.Client(), t.TempDir()), server.URL)
+
+	watch, out := newTestWatch("added")
+	cursor, err := watchCursor(server.URL+"/boxes/24088/postings/changes.json?since=2026-08-18T09%3A00%3A00.000Z&v=2", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	watch.boxes[24088].cursor = cursor
+
+	if err := watch.catchUp(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// The connection drops before the retry: disconnected, and the ready that
+	// was owed is not — the reconnect will catch up and announce its own.
+	watch.noteConnection(false)
+	if err := watch.followConnection(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	broken = false
+	if err := watch.retryUnread(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 1 || !strings.Contains(lines[0], `"change":"disconnected"`) {
+		t.Errorf("wrote %q, want disconnected alone — no ready while the connection is down", out.String())
+	}
+
+	// The reconnect catches up and says ready.
+	watch.noteConnection(true)
+	if err := watch.followConnection(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out.String(), `"change":"ready"`) {
+		t.Errorf("wrote %q, want ready after the reconnect's catch-up", out.String())
+	}
 }
 
 func TestWatchGivesUpOnABoxThatHasGone(t *testing.T) {
@@ -434,10 +647,10 @@ func TestWatchGivesUpOnABoxThatHasGone(t *testing.T) {
 	defer server.Close()
 	initSDK(auth.NewManager(server.URL, server.Client(), t.TempDir()), server.URL)
 
-	watch, _ := newTestWatch("added")
+	watch, out := newTestWatch("added", "resync")
 	errOut := &bytes.Buffer{}
 	watch.errOut = errOut
-	watch.boxes[31145] = &watchedBox{id: 31145, kind: "papertrail", name: "The Paper Trail"}
+	watch.boxes[31145] = &watchedBox{id: 31145, kind: "papertrail", name: "The Paper Trail", reported: true}
 	watch.boxes[24088].cursor.Since = "2026-08-01T00:00:00.000Z"
 
 	if err := watch.readBox(context.Background(), watch.boxes[24088]); err != nil {
@@ -449,6 +662,9 @@ func TestWatchGivesUpOnABoxThatHasGone(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "can no longer be followed") {
 		t.Errorf("stderr = %q, want the box's departure reported", errOut.String())
+	}
+	if out.Len() != 0 {
+		t.Errorf("wrote %q, want no resync for a box that is gone — there is nothing to re-read", out.String())
 	}
 
 	// Now the last box goes too, and there is nothing left to wait for.
@@ -464,6 +680,26 @@ func TestWatchGivesUpOnABoxThatHasGone(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not found") {
 		t.Errorf("error = %v, want it to say the box is gone", err)
+	}
+}
+
+func TestWatchGivesUpWhenTheLastReportedBoxHasGone(t *testing.T) {
+	t.Setenv("HEY_TOKEN", "test-token")
+	// The Feed is still listed, but --box imbox only ever reported the Imbox,
+	// and that one is gone: following The Feed for the record alone is a watch
+	// that would sit there for good, reporting nothing.
+	server := boxesAndChanges(t, `[{"id":24089,"kind":"feedbox","name":"The Feed","posting_changes_url":"/boxes/24089/postings/changes.json?since=2026-08-21T11%3A02%3A00.000Z&v=2"}]`)
+	defer server.Close()
+	initSDK(auth.NewManager(server.URL, server.Client(), t.TempDir()), server.URL)
+
+	watch, _ := newTestWatch("added")
+	watch.errOut = &bytes.Buffer{}
+	watch.boxes[24089] = &watchedBox{id: 24089, kind: "feedbox", name: "The Feed", reported: false}
+	watch.boxes[24088].cursor.Since = "2026-08-01T00:00:00.000Z"
+
+	err := watch.readBox(context.Background(), watch.boxes[24088])
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Errorf("error = %v, want the watch to give up once no reported box is left", err)
 	}
 }
 
@@ -519,15 +755,275 @@ func TestWatchRunsBoundedAsyncScripts(t *testing.T) {
 	}
 }
 
-func TestAskForCatchUpNeverBlocks(t *testing.T) {
+func TestConnectionChangesQueueInOrderAndNeverBlock(t *testing.T) {
 	watch, _ := newTestWatch("added")
 
-	watch.askForCatchUp()
-	watch.askForCatchUp()
+	watch.noteConnection(false)
+	watch.noteConnection(true)
+	watch.noteConnection(false)
 
 	select {
-	case <-watch.catchUp:
+	case <-watch.connection:
 	default:
-		t.Fatal("a catch-up should be waiting")
+		t.Fatal("a wake-up should be waiting")
+	}
+	var transitions []bool
+	for {
+		connected, queued := watch.nextTransition()
+		if !queued {
+			break
+		}
+		transitions = append(transitions, connected)
+	}
+	if !slices.Equal(transitions, []bool{false, true, false}) {
+		t.Errorf("transitions = %v, want every change in the order it happened", transitions)
+	}
+}
+
+func TestWatchReadyYieldsToADropQueuedBehindTheReconnect(t *testing.T) {
+	server := changesServer(t, `{}`)
+	watch, out := newTestWatch("added")
+	cursor, err := watchCursor(server.URL+"/boxes/24088/postings/changes.json?since=2026-08-21T09%3A00%3A00.000Z&v=2", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	watch.boxes[24088].cursor = cursor
+
+	// A reconnect and then a drop, both queued before the loop got to them:
+	// the reconnect's catch-up must see the drop still waiting behind it.
+	watch.noteConnection(true)
+	watch.noteConnection(false)
+	if err := watch.followConnection(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 1 || !strings.Contains(lines[0], `"change":"disconnected"`) {
+		t.Errorf("wrote %q, want disconnected alone — no ready with the connection already down", out.String())
+	}
+
+	watch.noteConnection(true)
+	if err := watch.followConnection(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out.String(), `"change":"ready"`) {
+		t.Errorf("wrote %q, want ready after the reconnect that stuck", out.String())
+	}
+}
+
+func TestWatchDoesNotSayReadyOnItsWayOut(t *testing.T) {
+	server := changesServer(t, `{"added":[{"id":9001,"kind":"topic","box_id":24088,"app_url":"https://app.hey.com/topics/5511"}]}`)
+
+	// The catch-up reported the one change --exit-on-first was waiting for.
+	watch, out := newTestWatch("added")
+	watch.exitOnFirst = true
+	cursor, err := watchCursor(server.URL+"/boxes/24088/postings/changes.json?since=2026-08-21T09%3A00%3A00.000Z&v=2", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	watch.boxes[24088].cursor = cursor
+	if err := watch.catchUp(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out.String(), `"posting_id":9001`) || strings.Contains(out.String(), `"change":"ready"`) {
+		t.Errorf("wrote %q, want the change and no ready from a watch that is exiting", out.String())
+	}
+
+	// The catch-up was interrupted mid-read.
+	interrupted, out := newTestWatch("added")
+	interrupted.boxes[24088].cursor = cursor
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := interrupted.catchUp(ctx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("wrote %q, want nothing from a catch-up cut short by an interrupt", out.String())
+	}
+}
+
+func TestWatchedBoxesStartNoLaterThanTheWatchDid(t *testing.T) {
+	t.Setenv("HEY_TOKEN", "test-token")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// The Imbox's last activity is after the watch read HEY's clock — mail
+		// landed in between; The Feed's is before.
+		_, _ = w.Write([]byte(`[{"id":24088,"kind":"imbox","name":"Imbox","posting_changes_url":"/boxes/24088/postings/changes.json?since=2026-08-21T09%3A00%3A30.000Z&v=2"},` +
+			`{"id":24089,"kind":"feedbox","name":"The Feed","posting_changes_url":"/boxes/24089/postings/changes.json?since=2026-08-21T08%3A00%3A00.000Z&v=2"}]`))
+	}))
+	defer server.Close()
+	initSDK(auth.NewManager(server.URL, server.Client(), t.TempDir()), server.URL)
+
+	command := newWatchCommand()
+	boxes, err := command.watchedBoxes(context.Background(), watchStarted)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := boxes[24088].cursor.Since; got != "2026-08-21T09:00:00.000Z" {
+		t.Errorf("Imbox cursor = %q, want it moved back to the watch's start so the mail in between is read", got)
+	}
+	if got := boxes[24089].cursor.Since; got != "2026-08-21T08:00:00.000Z" {
+		t.Errorf("Feed cursor = %q, want the box's own when it is earlier", got)
+	}
+	if !boxes[24088].reported || !boxes[24089].reported {
+		t.Error("without --box every box is reported")
+	}
+
+	// --box imbox: every box is still followed, the Imbox alone is reported;
+	// a --box that names nothing is not found.
+	command.boxes = []string{"imbox"}
+	boxes, err = command.watchedBoxes(context.Background(), watchStarted)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(boxes) != 2 || !boxes[24088].reported || boxes[24089].reported {
+		t.Errorf("boxes = %+v, want both followed and the Imbox alone reported", boxes)
+	}
+	command.boxes = []string{"trailbox"}
+	if _, err := command.watchedBoxes(context.Background(), watchStarted); err == nil {
+		t.Error("expected an error when --box names no box")
+	}
+	command.boxes = nil
+
+	// --since is the reader's choice and wins over both.
+	command.since = "2026-08-21T09:30:00Z"
+	boxes, err = command.watchedBoxes(context.Background(), watchStarted)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := boxes[24088].cursor.Since; got != "2026-08-21T09:30:00.000Z" {
+		t.Errorf("cursor = %q, want --since untouched", got)
+	}
+}
+
+func TestWatchAnnouncesADropBeforeTheReconnectThatFollowedIt(t *testing.T) {
+	server := changesServer(t, `{}`)
+	watch, _ := newTestWatch("added")
+	cursor, err := watchCursor(server.URL+"/boxes/24088/postings/changes.json?since=2026-08-21T09%3A00%3A00.000Z&v=2", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	watch.boxes[24088].cursor = cursor
+
+	// The reconnect completed before the loop got round to the drop: the
+	// reader still has to see them in this order, or it ends up offline.
+	watch.noteConnection(false)
+	watch.noteConnection(true)
+	if err := watch.followConnection(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(watch.out.(*bytes.Buffer).String()), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], `"change":"disconnected"`) || !strings.Contains(lines[1], `"change":"ready"`) {
+		t.Errorf("wrote %q, want disconnected then ready", lines)
+	}
+}
+
+func TestWatchAnnouncesItselfOnStdoutOnly(t *testing.T) {
+	watch, out := newTestWatch("added")
+	watch.exitOnFirst = true
+
+	watch.announce(watchReady)
+	watch.announce(watchDisconnected)
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("wrote %d lines, want ready and disconnected: %q", len(lines), out.String())
+	}
+	var ready map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &ready); err != nil {
+		t.Fatalf("ready isn't JSON: %v", err)
+	}
+	if ready["change"] != "ready" || ready["at"] == "" {
+		t.Errorf("ready = %v, want its change and a time", ready)
+	}
+	if _, has := ready["box"]; has {
+		t.Errorf("ready is about the watch, not a box: %v", ready)
+	}
+	if _, has := ready["posting_id"]; has {
+		t.Errorf("ready has no posting: %v", ready)
+	}
+	if !strings.Contains(lines[1], `"change":"disconnected"`) {
+		t.Errorf("second line = %q, want disconnected", lines[1])
+	}
+	if watch.finished() {
+		t.Error("the watch's own news never counts towards --exit-on-first")
+	}
+
+	scripted, scriptOut := newTestWatch("added")
+	scripted.syncScript = "cat"
+	scripted.announce(watchReady)
+	if scriptOut.Len() != 0 {
+		t.Errorf("a script runs per change, and ready is not one: %q", scriptOut.String())
+	}
+}
+
+func TestWatchReportsAResyncWhenAskedFor(t *testing.T) {
+	watch, out := newTestWatch("deleted", "resync")
+	watch.exitOnFirst = true
+
+	if !watch.report(context.Background(), watchEvent{Change: watchResync, At: "2026-08-21T09:00:00.000Z"}, watch.boxes[24088], nil) {
+		t.Fatal("a resync is reported when --events has it")
+	}
+	if !strings.Contains(out.String(), `"change":"resync"`) || !strings.Contains(out.String(), `"kind":"imbox"`) {
+		t.Errorf("wrote %q, want the resync with its box", out.String())
+	}
+	if !watch.finished() {
+		t.Error("a resync is a change, so --exit-on-first counts it")
+	}
+
+	// --events new is new mail only: a resync is not, so a script for new
+	// mail never runs on one and --exit-on-first never exits on one.
+	newOnly, out := newTestWatch("new")
+	newOnly.exitOnFirst = true
+	if newOnly.report(context.Background(), watchEvent{Change: watchResync, At: "2026-08-21T09:00:00.000Z"}, newOnly.boxes[24088], nil) {
+		t.Error("--events new must leave a resync out")
+	}
+	if out.Len() != 0 || newOnly.finished() {
+		t.Errorf("wrote %q, finished %v; want nothing for a resync under --events new", out.String(), newOnly.finished())
+	}
+}
+
+func TestWatchReportsAResyncAfterSkippingAhead(t *testing.T) {
+	t.Setenv("HEY_TOKEN", "test-token")
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/postings/changes") {
+			// As haystack answers: `head :conflict`, no body.
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"id":24088,"kind":"imbox","name":"Imbox","posting_changes_url":"` + server.URL + `/boxes/24088/postings/changes.json?since=2026-08-21T12%3A00%3A00.000Z&v=2"}]`))
+	}))
+	defer server.Close()
+	initSDK(auth.NewManager(server.URL, server.Client(), t.TempDir()), server.URL)
+
+	watch, out := newTestWatch("added", "resync")
+	cursor, err := watchCursor(server.URL+"/boxes/24088/postings/changes.json?since=2026-08-18T09%3A00%3A00.000Z&v=2", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	watch.boxes[24088].cursor = cursor
+
+	if err := watch.read(context.Background(), actioncable.Message(`{"change":"upsert","box_id":24088}`)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var event watchEvent
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &event); err != nil {
+		t.Fatalf("output isn't one JSON line: %q (stderr %q)", out.String(), watch.errOut.(*bytes.Buffer).String())
+	}
+	if event.Change != watchResync || event.Box == nil || event.Box.ID != 24088 {
+		t.Errorf("event = %+v, want a resync for the Imbox", event)
+	}
+	if watch.boxes[24088].cursor.Since != "2026-08-21T12:00:00.000Z" {
+		t.Errorf("cursor = %+v, want it moved to the server's current one", watch.boxes[24088].cursor)
+	}
+}
+
+func TestWatchLineDescribesTheWatchsOwnNews(t *testing.T) {
+	line := watchLine(watchEvent{Change: watchReady, At: "2026-08-21T09:00:00.000Z"})
+	if !strings.Contains(line, "ready") || !strings.Contains(line, "watching for changes") {
+		t.Errorf("line = %q, want ready described without a box", line)
 	}
 }
