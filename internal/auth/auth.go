@@ -328,6 +328,11 @@ func (m *Manager) waitForCallback(ctx context.Context, expectedState, authURL, c
 	errCh := make(chan error, 1)
 	var shutdownOnce sync.Once
 
+	// Captured here because the shutdown below reports from a goroutine that
+	// outlives this call, and os.Stderr is a global somebody else may be
+	// swapping by then.
+	stderr := os.Stderr
+
 	server := &http.Server{
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
@@ -345,7 +350,7 @@ func (m *Manager) waitForCallback(ctx context.Context, expectedState, authURL, c
 				// net.ErrClosed, which is the server being down, not a failure.
 				if shutdownErr := server.Shutdown(shutdownCtx); shutdownErr != nil &&
 					!errors.Is(shutdownErr, http.ErrServerClosed) && !errors.Is(shutdownErr, net.ErrClosed) {
-					fmt.Fprintf(os.Stderr, "warning: callback server shutdown failed: %v\n", shutdownErr)
+					fmt.Fprintf(stderr, "warning: callback server shutdown failed: %v\n", shutdownErr)
 				}
 			}()
 		})

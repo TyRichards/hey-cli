@@ -102,6 +102,10 @@ func TestKeyringFailures(t *testing.T) {
 		fake := newFakeKeyring()
 		fake.setErr = errors.New("keyring unavailable")
 		store := keyringStore(t, fake)
+
+		var warned []string
+		store.warn = func(msg string) { warned = append(warned, msg) }
+
 		if err := store.Save("https://app.hey.com", &Credentials{AccessToken: "file-token"}); err != nil {
 			t.Fatalf("Save fallback: %v", err)
 		}
@@ -110,6 +114,14 @@ func TestKeyringFailures(t *testing.T) {
 		}
 		if _, err := os.Stat(store.credentialsPath()); err != nil {
 			t.Fatalf("fallback credentials file: %v", err)
+		}
+
+		warning := strings.Join(warned, "")
+		if !strings.Contains(warning, "system keyring unavailable") {
+			t.Errorf("warning = %q, want the plaintext-fallback notice", warning)
+		}
+		if !strings.Contains(warning, store.credentialsPath()) {
+			t.Errorf("warning = %q, want the credentials path", warning)
 		}
 	})
 

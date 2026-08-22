@@ -36,15 +36,20 @@ type Store struct {
 	noKeyring   bool
 	fallbackDir string
 	keyring     credentialKeyring
+	warn        func(msg string)
 	lockMu      sync.Mutex
 }
 
 // NewStore creates a credential store. Keyring availability is probed lazily
-// on first credential operation, not at construction time.
+// on first credential operation, not at construction time -- so warn captures
+// os.Stderr here rather than reading the global whenever that probe happens.
 func NewStore(fallbackDir string) *Store {
+	stderr := os.Stderr
+
 	return &Store{
 		fallbackDir: fallbackDir,
 		noKeyring:   os.Getenv("HEY_NO_KEYRING") != "",
+		warn:        func(msg string) { fmt.Fprint(stderr, msg) },
 		keyring: credentialKeyring{
 			set:    keyring.Set,
 			get:    keyring.Get,
@@ -65,8 +70,8 @@ func (s *Store) ensureInit() {
 			s.useKeyring = true
 			return
 		}
-		fmt.Fprintf(os.Stderr, "warning: system keyring unavailable, credentials stored in plaintext at %s\n",
-			filepath.Join(s.fallbackDir, "credentials.json"))
+		s.warn(fmt.Sprintf("warning: system keyring unavailable, credentials stored in plaintext at %s\n",
+			filepath.Join(s.fallbackDir, "credentials.json")))
 	})
 }
 
