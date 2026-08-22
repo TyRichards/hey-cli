@@ -284,7 +284,7 @@ func TestCursorStylesCarryTheSelectionBackground(t *testing.T) {
 	if marker.GetBackground() != want || text.GetBackground() != want || gap.GetBackground() != want {
 		t.Error("every cursor-row segment a section renders through the helpers must carry the selection background")
 	}
-	if renderScreenerRows(&screenerPane{rows: []screenerRow{{detail: "maria@example.com"}}}, 5, 40) == "" {
+	if renderScreenerRows(&screenerPane{rows: []screenerRow{{subject: "maria@example.com"}}}, 5, 40) == "" {
 		t.Error("screener rows should render")
 	}
 }
@@ -295,6 +295,9 @@ func TestPillTextReadsOnTheAccent(t *testing.T) {
 	applyTheme(defaultTheme())
 	if colorOnAccent != color.Color(lipgloss.Black) {
 		t.Errorf("the ANSI accent keeps the classic black pill text, got %v", colorOnAccent)
+	}
+	if colorLink != color.Color(lipgloss.BrightCyan) {
+		t.Errorf("the default theme keeps links cyan, got %v", colorLink)
 	}
 
 	// lupine's dark blue carries black at ~3.7:1; white reads better.
@@ -314,6 +317,9 @@ func TestPillTextReadsOnTheAccent(t *testing.T) {
 	applyTheme(noColorTheme())
 	if _, ok := colorOnAccent.(lipgloss.NoColor); !ok {
 		t.Errorf("NO_COLOR must keep the pill colorless, got %v", colorOnAccent)
+	}
+	if _, ok := colorLink.(lipgloss.NoColor); !ok {
+		t.Errorf("NO_COLOR must keep links colorless, got %v", colorLink)
 	}
 }
 

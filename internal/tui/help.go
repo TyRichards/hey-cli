@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // helpBinding is a key-description pair for the help bar.
@@ -77,7 +78,13 @@ func (h helpBar) view() string {
 
 	var items []item
 	for _, b := range h.bindings {
-		rendered := h.styles.helpKey.Render(b.key) + " " + h.styles.helpDesc.Render(b.desc)
+		var rendered string
+		if b.desc == "" {
+			// A pre-styled segment the caller rendered itself.
+			rendered = b.key
+		} else {
+			rendered = h.styles.helpKey.Render(b.key) + " " + h.styles.helpDesc.Render(b.desc)
+		}
 		items = append(items, item{str: rendered, width: lipgloss.Width(rendered)})
 	}
 
@@ -87,6 +94,17 @@ func (h helpBar) view() string {
 	lineWidth := 0
 
 	for _, it := range items {
+		if maxWidth > 0 && it.width > maxWidth {
+			if lineWidth > 0 {
+				lines = append(lines, line.String())
+				line.Reset()
+			}
+			wrapped := strings.Split(ansi.Wrap(it.str, maxWidth, ""), "\n")
+			lines = append(lines, wrapped[:len(wrapped)-1]...)
+			line.WriteString(wrapped[len(wrapped)-1])
+			lineWidth = lipgloss.Width(wrapped[len(wrapped)-1])
+			continue
+		}
 		if lineWidth > 0 && maxWidth > 0 && lineWidth+sepWidth+it.width > maxWidth {
 			lines = append(lines, line.String())
 			line.Reset()

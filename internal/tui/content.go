@@ -525,18 +525,20 @@ func (c *contentList) view() string {
 	rendered := 0
 	end := min(c.scrollOff+c.visibleItemsFrom(c.scrollOff), c.itemCount())
 
-	cursorMarker, _ := cursorStyles()
+	cursorMarker, cursorText := cursorStyles()
 	selectedGap := selectionStyle(lipgloss.NewStyle())
 	unseenDot := lipgloss.NewStyle().Foreground(colorAlert).Bold(true)
 	selectedMark := lipgloss.NewStyle().Foreground(colorPrimary).Bold(true)
 
-	// Every row uses the same styles: bold bright subject; date, sender and
-	// excerpt in the faint secondary style. Read state shows as the section a
-	// row sits in ("Bubbled Up" / "New for You" / "Previously Seen") plus the
-	// alert dot; the cursor row renders bold on top of the base styles.
+	// Every row uses the same styles: bold bright subject, a bright date,
+	// bold sender in the hyperlink color, and the excerpt in the faint
+	// secondary style. Read state shows as the section a row sits in
+	// ("Bubbled Up" / "New for You" / "Previously Seen") plus the alert dot;
+	// the cursor row uses the accent foreground that the selection-background
+	// contrast gate guarantees remains legible.
 	subjectBase := lipgloss.NewStyle().Foreground(colorBright).Bold(true)
-	dateBase := styleMuted
-	senderBase := styleMuted
+	dateBase := lipgloss.NewStyle().Foreground(colorBright)
+	senderBase := lipgloss.NewStyle().Foreground(colorLink).Bold(true)
 	excerptBase := styleMuted
 
 	// The date gets its own right-hand column, as in the HEY web app. Both
@@ -554,19 +556,19 @@ func (c *contentList) view() string {
 
 		if label := c.sectionLabelAt(i); label != "" {
 			if c.cover != coverNone && sectionOf(p) == sectionPreviouslySeen {
-				fmt.Fprintln(&b, coverHeader(label, "v to cover", c.width))
+				fmt.Fprintln(&b, coverHeader(label, "x to cover", c.width))
 			} else {
 				fmt.Fprintln(&b, sectionHeader(label, c.width))
 			}
 			rendered++
 		}
 
-		// The cursor row renders bold on top of the base styles and, when the
-		// theme has a usable selection, paints every segment — gaps included —
-		// with the selection background so it reads as one highlighted line.
+		// The cursor text takes the accent foreground that applyTheme checked
+		// against the selection background. Gaps keep only the background so the
+		// two lines read as one highlighted row.
 		emphasize := func(base lipgloss.Style) lipgloss.Style {
 			if isCursor {
-				base = selectionStyle(base.Bold(true))
+				return cursorText
 			}
 			return base
 		}
@@ -616,12 +618,13 @@ func (c *contentList) view() string {
 		line1.WriteString(gapStyle.Render(strings.Repeat(" ", gap)))
 		line1.WriteString(emphasize(dateBase).Render(date))
 
-		// Line 2: [│]   extension@ Creator Name — excerpt...
+		// Line 2: [│]     extension@ Creator Name — excerpt...
+		// Indented two columns past the subject, as in The Screener.
 		var line2 strings.Builder
 		if isCursor {
-			line2.WriteString(cursorMarker.Render("│") + gapStyle.Render("   "))
+			line2.WriteString(cursorMarker.Render("│") + gapStyle.Render("     "))
 		} else {
-			line2.WriteString("    ")
+			line2.WriteString("      ")
 		}
 
 		name := p.Creator.Name
@@ -644,15 +647,24 @@ func (c *contentList) view() string {
 			excerpt = " — " + p.Summary
 		}
 
-		if lipgloss.Width(sender) > textWidth {
-			sender = truncateToWidth(sender, textWidth)
+		detailWidth := max(textWidth-2, 1) // the indent narrows the second line
+		if lipgloss.Width(sender) > detailWidth {
+			sender = truncateToWidth(sender, detailWidth)
 			excerpt = ""
 		} else {
-			excerpt = truncateToWidth(excerpt, textWidth-lipgloss.Width(sender))
+			excerpt = truncateToWidth(excerpt, detailWidth-lipgloss.Width(sender))
 		}
 
 		line2.WriteString(emphasize(senderBase).Render(sender))
 		line2.WriteString(emphasize(excerptBase).Render(excerpt))
+		if isCursor {
+			// Pad to the full row width so the selection background also
+			// covers the space under the date.
+			pad := prefixWidth + textWidth + 2 + dateCol - 6 - lipgloss.Width(sender) - lipgloss.Width(excerpt)
+			if pad > 0 {
+				line2.WriteString(gapStyle.Render(strings.Repeat(" ", pad)))
+			}
+		}
 
 		fmt.Fprintln(&b, line1.String())
 		fmt.Fprintln(&b, line2.String())

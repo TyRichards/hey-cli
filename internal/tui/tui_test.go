@@ -704,8 +704,8 @@ func TestContentListStylesSeenAndUnseenRows(t *testing.T) {
 	if !strings.Contains(seenHeader, "Previously Seen") {
 		t.Errorf("the seen section should open with its header: %q", seenHeader)
 	}
-	if !strings.Contains(cursorLine1, "\x1b[1;94m") || !strings.Contains(cursorLine1, "│") {
-		t.Errorf("cursor row should show the primary-colored bar: %q", cursorLine1)
+	if !strings.Contains(cursorLine1, "\x1b[1;94mCursor row") || !strings.Contains(cursorLine1, "│") {
+		t.Errorf("cursor row should keep all text in the contrast-checked primary color: %q", cursorLine1)
 	}
 	if !strings.Contains(unseenLine1, "●") || !strings.Contains(unseenLine1, "\x1b[1;31m") {
 		t.Errorf("unseen row should show the unread dot in the alert color: %q", unseenLine1)
@@ -715,8 +715,12 @@ func TestContentListStylesSeenAndUnseenRows(t *testing.T) {
 	}
 
 	// Seen rows look the same as unseen rows — the section carries the state.
-	if !strings.Contains(seenLine1, "\x1b[1;97m") || !strings.Contains(seenLine1, "\x1b[2m") {
+	// The sender takes the hyperlink color; the date shares the subject color.
+	if !strings.Contains(seenLine1, "\x1b[1;97m") || !strings.Contains(seenLine1, "\x1b[97m") {
 		t.Errorf("seen row should keep the full row styling: %q", seenLine1)
+	}
+	if !strings.Contains(unseenLine2, "\x1b[1;96m") || !strings.Contains(seenLine2, "\x1b[1;96m") {
+		t.Errorf("sender names should be bold hyperlink cyan in both sections: %q / %q", unseenLine2, seenLine2)
 	}
 	if !strings.Contains(unseenLine2, "\x1b[2m") || !strings.Contains(seenLine2, "\x1b[2m") {
 		t.Errorf("second lines should be faint secondary text in both sections: %q / %q", unseenLine2, seenLine2)
@@ -857,10 +861,13 @@ func TestContentListAlignsDateColumn(t *testing.T) {
 	}
 
 	dateCol := lipgloss.Width("Aug 20, 2026")
-	for _, second := range []string{lines[2], lines[5]} {
-		if lipgloss.Width(second) > firstWidth-dateCol-2 {
-			t.Errorf("second line reaches into the date column: %q", second)
-		}
+	// The cursor row (row 0) pads its second line to the full row width so
+	// the selection background also covers the space under the date.
+	if lipgloss.Width(lines[2]) != firstWidth {
+		t.Errorf("cursor row second line width = %d, want the full row width %d", lipgloss.Width(lines[2]), firstWidth)
+	}
+	if lipgloss.Width(lines[5]) > firstWidth-dateCol-2 {
+		t.Errorf("second line text reaches into the date column: %q", lines[5])
 	}
 }
 
