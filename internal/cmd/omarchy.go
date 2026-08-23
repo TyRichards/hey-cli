@@ -77,7 +77,7 @@ func liveOmarchyEnv() omarchyEnv {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), omarchyCommandTimeout)
 			defer cancel()
-			cmd := exec.CommandContext(ctx, name, args...) //nolint:gosec // G204: fixed omarchy command names
+			cmd := exec.CommandContext(ctx, name, args...) // #nosec G204 -- fixed omarchy command names
 			cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
 			return cmd.Run()
 		},
@@ -221,7 +221,7 @@ func omarchyMenuBlock() string {
 
 func (s omarchySetup) installMenu() omarchyStep {
 	path := s.env.menuPath()
-	current, err := os.ReadFile(path) //nolint:gosec // G304: fixed path under the user's config dir
+	current, err := os.ReadFile(path) // #nosec G304 -- fixed path under the user's config dir
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return stepResult("menu", path, false, err, "", "")
 	}
@@ -235,7 +235,7 @@ func (s omarchySetup) installMenu() omarchyStep {
 
 func (s omarchySetup) removeMenu() omarchyStep {
 	path := s.env.menuPath()
-	current, err := os.ReadFile(path) //nolint:gosec // G304: fixed path under the user's config dir
+	current, err := os.ReadFile(path) // #nosec G304 -- fixed path under the user's config dir
 	if errors.Is(err, os.ErrNotExist) {
 		return stepResult("menu", path, false, nil, "", "absent")
 	}
@@ -610,7 +610,7 @@ const omarchyTemplateMarker = "# hey-cli accent overlay"
 // file that exists but cannot be read is an error, not an absence: the
 // ownership guard must never be bypassed by an unreadable foreign file.
 func templateIsOurs(path string) (ours, exists bool, err error) {
-	current, err := os.ReadFile(path) //nolint:gosec // G304: fixed path under the user's config dir
+	current, err := os.ReadFile(path) // #nosec G304 -- fixed path under the user's config dir
 	if errors.Is(err, os.ErrNotExist) {
 		// A dangling symlink reads as missing but is still the user's link;
 		// ownership cannot be established, so it is foreign, not absent.
@@ -673,7 +673,7 @@ func (s omarchySetup) removeTemplate() omarchyStep {
 // the target is replaced rather than the link, and an existing file keeps its
 // mode: perm applies to files created from nothing.
 func writeFileIfChanged(path string, data []byte, perm os.FileMode) (bool, error) {
-	if current, err := os.ReadFile(path); err == nil && bytes.Equal(current, data) { //nolint:gosec // G304: caller-controlled config path
+	if current, err := os.ReadFile(path); err == nil && bytes.Equal(current, data) { // #nosec G304 -- caller-controlled config path
 		return false, nil
 	}
 	if target, err := filepath.EvalSymlinks(path); err == nil {
