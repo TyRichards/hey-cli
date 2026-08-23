@@ -18,18 +18,53 @@ const turboStreamsChannel = "Turbo::StreamsChannel"
 // instead of blocking the relay. A full backlog means a re-read is already coming.
 const mailChangeBacklog = 16
 
-// reconnectBacklog is one, because a reconnect always says the same thing. It is a
-// channel of its own so that the relay goroutine is the only writer to the channel it
-// closes: the cable client drains callbacks queued before it was told to stop, and a
+// reconnectBacklog is one, because a Screener reconnect always says the same thing. It
+// is a channel of its own so that the relay goroutine is the only writer to the channel
+// it closes: the cable client drains callbacks queued before it was told to stop, and a
 // send on a closed channel panics whatever the select around it says — off a goroutine
 // Bubble Tea knows nothing about, which takes the terminal down in raw mode. Nothing
 // closes this one, so a callback arriving after the relay is gone rings into the buffer
 // and is collected with it.
 const reconnectBacklog = 1
 
-// unsubscribeTimeout bounds the goodbye sent for a watch that is over. Nothing waits on
-// it, and a connection that has gone away is reason to stop trying rather than to hang.
-const unsubscribeTimeout = 5 * time.Second
+type mailConnectionNotifier struct {
+	sync.Mutex
+	event   tui.MailWatchEvent
+	version uint64
+	wake    chan struct{}
+}
+
+func newMailConnectionNotifier() *mailConnectionNotifier {
+	return &mailConnectionNotifier{wake: make(chan struct{}, 1)}
+}
+
+// note keeps the newest connection state and wakes the relay without blocking Action
+// Cable's callback dispatcher. If a disconnect and reconnect arrive before the relay can
+// draw either, the reconnect is the state that matters and still asks for a catch-up.
+func (n *mailConnectionNotifier) note(connection tui.MailConnection, willReconnect bool) {
+	n.Lock()
+	n.event = tui.MailWatchEvent{Connection: connection, WillReconnect: willReconnect}
+	n.version++
+	n.Unlock()
+	ring(n.wake, struct{}{})
+}
+
+func (n *mailConnectionNotifier) after(version uint64) (tui.MailWatchEvent, uint64, bool) {
+	n.Lock()
+	defer n.Unlock()
+	return n.event, n.version, n.version != version
+}
+
+const (
+	// unsubscribeTimeout bounds the goodbye sent for a watch that is over. Nothing waits
+	// on it, and a connection that has gone away is reason to stop trying rather than hang.
+	unsubscribeTimeout = 5 * time.Second
+
+	// tuiCableDialTimeout turns an unreachable cable server into app state instead of
+	// leaving the startup command inside Action Cable's retry loop forever. The model
+	// owns the retries after this first bounded attempt.
+	tuiCableDialTimeout = 5 * time.Second
+)
 
 // tuiWatchers are the streams `hey tui` follows to stay live.
 func tuiWatchers() tui.Watchers {
@@ -43,40 +78,45 @@ func tuiWatchers() tui.Watchers {
 //
 // The stream closes when ctx is done, or when the connection is gone for good, which is
 // how the TUI hears that its list has stopped being live.
-func watchMailChanges(ctx context.Context) (<-chan int64, error) {
-	// A reconnect stands for every box: the changes broadcast while the connection was
-	// down were missed, and the box on screen has to be read again to find them. It
-	// arrives on a channel of its own so that the relay is the only thing writing to
-	// the one the TUI reads — see reconnectBacklog.
-	reconnects := make(chan struct{}, reconnectBacklog)
-	subscription, err := tuiSubscribe(ctx, actioncable.Identifier{Channel: changesChannel},
+func watchMailChanges(ctx context.Context) (<-chan tui.MailWatchEvent, error) {
+	connection := newMailConnectionNotifier()
+	subscription, err := tuiSubscribe(ctx, ctx, actioncable.Identifier{Channel: changesChannel},
 		actioncable.OnConnected(func(reconnected bool) {
 			if reconnected {
-				ring(reconnects, struct{}{})
+				connection.note(tui.MailConnectionReconnected, false)
 			}
+		}),
+		actioncable.OnDisconnected(func(willReconnect bool) {
+			connection.note(tui.MailConnectionDisconnected, willReconnect)
 		}))
 	if err != nil {
 		return nil, err
 	}
 
-	changes := make(chan int64, mailChangeBacklog)
+	events := make(chan tui.MailWatchEvent, mailChangeBacklog)
 	go func() {
 		defer unsubscribe(ctx, subscription)
-		relayMailChanges(ctx, subscription.Messages(), reconnects, changes)
+		relayMailChanges(ctx, subscription.Messages(), connection, events)
 	}()
 
-	return changes, nil
+	return events, nil
 }
 
-func relayMailChanges(ctx context.Context, messages <-chan actioncable.Message, reconnects <-chan struct{}, changes chan<- int64) {
-	defer close(changes)
+func relayMailChanges(ctx context.Context, messages <-chan actioncable.Message, connection *mailConnectionNotifier, events chan tui.MailWatchEvent) {
+	defer close(events)
+	var connectionVersion uint64
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-reconnects:
-			ring(changes, tui.AnyBoxChanged)
+		case <-connection.wake:
+			event, version, changed := connection.after(connectionVersion)
+			if !changed {
+				continue
+			}
+			connectionVersion = version
+			ringMailWatchEvent(events, event)
 		case message, open := <-messages:
 			if !open {
 				return
@@ -87,11 +127,7 @@ func relayMailChanges(ctx context.Context, messages <-chan actioncable.Message, 
 			if err := message.Unmarshal(&notification); err != nil {
 				continue
 			}
-			select {
-			case changes <- notification.BoxID:
-			case <-ctx.Done():
-				return
-			}
+			ringMailWatchEvent(events, tui.MailWatchEvent{BoxID: notification.BoxID})
 		}
 	}
 }
@@ -101,9 +137,9 @@ func relayMailChanges(ctx context.Context, messages <-chan actioncable.Message, 
 // and serves the signed name of that stream with the pending count. What it broadcasts is
 // markup for the web app, so nothing is read out of it: the arrival is the whole message,
 // and the TUI reads the count again behind it.
-func watchScreenerChanges(ctx context.Context, signedStreamName string) (<-chan struct{}, error) {
+func watchScreenerChanges(ctx, connectionCtx context.Context, signedStreamName string) (<-chan struct{}, error) {
 	reconnects := make(chan struct{}, reconnectBacklog)
-	subscription, err := tuiSubscribe(ctx, actioncable.Identifier{
+	subscription, err := tuiSubscribe(ctx, connectionCtx, actioncable.Identifier{
 		Channel: turboStreamsChannel,
 		Params:  actioncable.Params{"signed_stream_name": signedStreamName},
 	}, actioncable.OnConnected(func(reconnected bool) {
@@ -153,6 +189,58 @@ func unsubscribe(ctx context.Context, subscription *actioncable.Subscription) {
 	_ = subscription.Unsubscribe(goodbye)
 }
 
+// ringMailWatchEvent keeps connection state ahead of stale box doorbells. Box events can
+// be coalesced because one re-read catches up every posting in that box; a connection
+// transition empties that backlog so the global status changes promptly, and reconnecting
+// catches the visible box up without relying on an older doorbell.
+func ringMailWatchEvent(events chan tui.MailWatchEvent, event tui.MailWatchEvent) {
+	if event.Connection == tui.MailConnectionUnchanged {
+		select {
+		case events <- event:
+			return
+		default:
+		}
+
+		// A full queue may contain changes for boxes other than the one on screen.
+		// Replace its box-specific doorbells with one catch-all rather than dropping
+		// this box and assuming another event will happen to refresh it. Keep a queued
+		// connection transition ahead of that catch-up.
+		var connection *tui.MailWatchEvent
+	boxBacklog:
+		for {
+			select {
+			case queued := <-events:
+				if queued.Connection != tui.MailConnectionUnchanged {
+					latest := queued
+					connection = &latest
+				}
+			default:
+				break boxBacklog
+			}
+		}
+		if connection != nil {
+			ring(events, *connection)
+		}
+		ring(events, tui.MailWatchEvent{BoxID: tui.AnyBoxChanged})
+		return
+	}
+
+	for {
+		select {
+		case <-events:
+			continue
+		default:
+		}
+		select {
+		case events <- event:
+			return
+		default:
+			// The reader raced us between draining and sending. Try the now-current
+			// queue again rather than blocking Action Cable's relay.
+		}
+	}
+}
+
 // ring drops the notification when one is already waiting: they all say the same thing,
 // and a reader that has fallen behind must not hold up the goroutine doing the ringing.
 func ring[T any](notifications chan<- T, notification T) {
@@ -163,25 +251,44 @@ func ring[T any](notifications chan<- T, notification T) {
 }
 
 // tuiSubscribe subscribes over the connection the TUI's watches share, dialling a new one
-// when the one on hand has stopped itself. A client the server hung up on for good answers
-// every Subscribe with ErrClosed and never dials again on its own, so a Screener stream
-// reopened after that would find a dead connection and stay dead. Each dial carries
-// current credentials, which is what makes redialling worth doing.
-func tuiSubscribe(ctx context.Context, identifier actioncable.Identifier, options ...actioncable.SubscriptionOption) (*actioncable.Subscription, error) {
-	client, err := tuiCableClient(ctx)
+// when the one on hand has stopped itself. A stopped client preserves its terminal failure
+// and never dials again on its own, so a reopened stream replaces it with a connection that
+// carries current credentials.
+func tuiSubscribe(ctx, connectionCtx context.Context, identifier actioncable.Identifier, options ...actioncable.SubscriptionOption) (*actioncable.Subscription, error) {
+	client, err := tuiCableClient(connectionCtx)
 	if err != nil {
 		return nil, err
 	}
 
-	subscription, err := client.Subscribe(ctx, identifier, options...)
-	if errors.Is(err, actioncable.ErrClosed) {
-		forgetTuiCable(client)
-		if client, err = tuiCableClient(ctx); err != nil {
-			return nil, err
-		}
-		subscription, err = client.Subscribe(ctx, identifier, options...)
+	subscription, stopped, err := subscribeTuiCable(ctx, client, identifier, options...)
+	if !stopped {
+		return subscription, err
 	}
+
+	client, err = tuiCableClient(connectionCtx)
+	if err != nil {
+		return nil, err
+	}
+	subscription, _, err = subscribeTuiCable(ctx, client, identifier, options...)
 	return subscription, err
+}
+
+// subscribeTuiCable returns stopped when the shared client needs replacing. Every shared
+// client has connected before it is cached, so Connect reports ErrAlreadyConnected while
+// it is live or reconnecting and preserves the terminal failure after it stops.
+func subscribeTuiCable(ctx context.Context, client *actioncable.Client, identifier actioncable.Identifier, options ...actioncable.SubscriptionOption) (*actioncable.Subscription, bool, error) {
+	subscription, err := client.Subscribe(ctx, identifier, options...)
+	if err == nil {
+		return subscription, false, nil
+	}
+
+	stoppedBecause := client.Connect(ctx)
+	if errors.Is(stoppedBecause, actioncable.ErrAlreadyConnected) {
+		return nil, false, err
+	}
+
+	forgetTuiCable(client)
+	return nil, true, watchDialError(stoppedBecause)
 }
 
 // tuiCable is the one connection the TUI's watches share — two subscriptions over one
@@ -200,7 +307,9 @@ func tuiCableClient(ctx context.Context) (*actioncable.Client, error) {
 		return tuiCable.client, nil
 	}
 
-	client, err := cable.Dial(ctx, cfg.BaseURL, authMgr)
+	dialing, stopDialing := context.WithTimeout(ctx, tuiCableDialTimeout)
+	defer stopDialing()
+	client, err := cable.Dial(dialing, cfg.BaseURL, authMgr)
 	if err != nil {
 		return nil, watchDialError(err)
 	}
