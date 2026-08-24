@@ -2,21 +2,19 @@ package cmd
 
 import (
 	"bytes"
-	"context"
 	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/basecamp/hey-cli/internal/apierr"
+	"github.com/basecamp/hey-cli/internal/config"
 	"github.com/basecamp/hey-cli/internal/output"
 )
 
@@ -40,9 +38,6 @@ const (
 	omarchyMenuEnd      = "  // <<< hey-cli"
 	omarchyFocusCommand = "omarchy-launch-or-focus-tui --app-id=" + omarchyAppID + " hey tui"
 	omarchyBarGlyph     = "" // nf-fa-envelope; verified to render in the bar's JetBrainsMono Nerd Font
-	// omarchy-theme-refresh re-renders every template and retints every app; a
-	// minute is generous.
-	omarchyCommandTimeout = time.Minute
 	// The hint spells the focus command out rather than using `{ tui = "hey tui" }`:
 	// the lua helper shell-quotes that into one word and launch-or-focus-tui would
 	// derive the app-id from it, never matching the window every other surface opens.
@@ -61,27 +56,23 @@ SUPER+SHIFT+E still opens the HEY web app. To point it at the TUI instead:
 type omarchyEnv struct {
 	home        string
 	omarchyPath string
+	stateDir    string   // hey's own state dir, holding the bar plugin marker and lock
 	iconRoots   []string // icon theme roots searched for Omarchy's HEY icon
-	run         func(name string, args ...string) error
+	run         func(name string, args ...string) (string, error)
 }
 
 func liveOmarchyEnv() omarchyEnv {
 	home, _ := os.UserHomeDir()
-	return omarchyEnv{
+	env := omarchyEnv{
 		home:        home,
 		omarchyPath: os.Getenv("OMARCHY_PATH"),
+		stateDir:    config.StateDir(),
 		iconRoots:   []string{filepath.Join(home, ".local", "share", "icons"), "/usr/share/icons"},
-		run: func(name string, args ...string) error {
-			if _, err := exec.LookPath(name); err != nil {
-				return err
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), omarchyCommandTimeout)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, name, args...) // #nosec G204 -- fixed omarchy command names
-			cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
-			return cmd.Run()
-		},
 	}
+	env.run = func(name string, args ...string) (string, error) {
+		return runOmarchyCommand(env.omarchyRoot(), name, args...)
+	}
+	return env
 }
 
 func (e omarchyEnv) detected() bool {
@@ -141,15 +132,23 @@ func (e omarchyEnv) iconName() string {
 
 type omarchyStep struct {
 	Name    string `json:"name"`
-	Status  string `json:"status"` // installed, unchanged, removed, absent, kept, failed
+	Status  string `json:"status"` // installed, unchanged, skipped, removed, absent, kept, failed
 	Detail  string `json:"detail,omitempty"`
 	Path    string `json:"path,omitempty"`
 	failure error
+	// attempted marks an outcome worth a line to a human — the sign-in hook
+	// and the wizard say nothing about a step that neither did nor owes
+	// anything.
+	attempted bool
 }
 
 type omarchySetup struct {
 	env    omarchyEnv
 	notify *bool // nil keeps the bar plugin's notify setting as it is
+	// forcePlugin is `hey setup omarchy`: install the bar plugin in every
+	// output format, finish a pending install, re-enable a disabled one, and
+	// carry a failure for every incomplete outcome.
+	forcePlugin bool
 }
 
 func (s omarchySetup) apply() []omarchyStep {
@@ -318,17 +317,16 @@ func stripMenuBlock(content string) string {
 }
 
 // Bar: the unread indicator is the 37signals.hey bar plugin
-// (github.com/basecamp/omarchy-hey-plugin), which runs `hey watch`. Setup
-// does not install it — a plugin is a git clone the user adds with `omarchy
-// plugin add` — but it finds the plugin's layout entry in shell.json and flips
-// its `notify` setting there, the way `omarchy bar set` would; the shell
-// hot-reloads the file. Earlier releases installed an inline `hey-unread`
-// command module instead, which setup now removes — two pollers in one slot —
-// carrying its notify choice over to the plugin when the plugin has none.
-// The toasts are the plugin's own, composed from the new-mail lines of `hey
-// watch`: no state file, so turning them on is nothing more than setting the key.
-
-const omarchyBarPluginInstall = "omarchy plugin add https://github.com/basecamp/omarchy-hey-plugin.git --enable"
+// (github.com/basecamp/omarchy-hey-plugin), which runs `hey watch`. Signing
+// in with hey offers to install it (omarchy_plugin.go), and `hey setup
+// omarchy` installs it explicitly; this file's part is the plugin's `notify`
+// setting on its layout entry in shell.json, the way `omarchy bar set` would
+// flip it; the shell hot-reloads the file. Earlier releases installed an
+// inline `hey-unread` command module instead, which setup still removes — two
+// pollers in one slot — carrying its notify choice over to the plugin when
+// the plugin has none. The toasts are the plugin's own, composed from the
+// new-mail lines of `hey watch`: no state file, so turning them on is nothing
+// more than setting the key.
 
 func notifyDetail(notify bool) string {
 	if notify {
@@ -337,9 +335,17 @@ func notifyDetail(notify bool) string {
 	return "notifications off"
 }
 
-// configureBarPlugin reports one step for the plugin and, only when there was
-// one to remove, a step for the legacy module before it.
+// configureBarPlugin reports one merged step for the plugin — its install
+// folded together with its notify setting — and, only when there was one to
+// remove, a step for the legacy module before it. The whole sequence holds
+// the plugin lock: the legacy and notify rewrites of shell.json act on what
+// they read, so a concurrent remove cannot slip between the read and the
+// write and have its disable overwritten.
 func (s omarchySetup) configureBarPlugin() []omarchyStep {
+	return s.underBarPluginLock(s.configureBarPluginLocked)
+}
+
+func (s omarchySetup) configureBarPluginLocked() []omarchyStep {
 	path := s.env.shellPath()
 	shell, err := s.loadShellConfig()
 	if err != nil {
@@ -349,35 +355,134 @@ func (s omarchySetup) configureBarPlugin() []omarchyStep {
 	if err != nil {
 		return []omarchyStep{stepResult("bar plugin", path, false, err, "", "")}
 	}
-	legacy, legacyNotified := s.removeLegacyBarModule(shell, layout)
-	var steps []omarchyStep
-	if legacy {
-		steps = append(steps, omarchyStep{Name: "bar indicator", Path: path, Status: "removed",
-			Detail: "hey-unread module removed; the " + omarchyBarPluginID + " plugin replaces it"})
-	}
+	// Peek only: the legacy indicator keeps working until its replacement
+	// is on the bar — a declined consent, a downed shell or a failed clone
+	// must not cost the user the panel they already have.
+	legacyPresent, legacyNotified := legacyIndicator(layout)
 
-	plugin := barLayoutModule(layout, omarchyBarPluginID)
-	if plugin == nil {
-		detail := "install the bar plugin: " + omarchyBarPluginInstall
-		if legacyNotified {
-			detail += "; then hey setup omarchy --notify to keep the toasts"
+	install := s.installBarPluginLocked()
+	if install.Status == "skipped" || install.Status == "failed" {
+		return []omarchyStep{install}
+	}
+	// The notify carry lands first; the legacy module — the only copy of
+	// that choice — leaves only once it has. A failed carry keeps the
+	// module for the rerun, so the preference cannot die with it.
+	merged := s.mergeNotify(install, legacyNotified)
+	if !legacyPresent || merged.Status == "failed" {
+		return []omarchyStep{merged}
+	}
+	return []omarchyStep{s.removeLegacyIndicator(false), merged}
+}
+
+// legacyIndicator reports whether layout still carries the inline hey-unread
+// module earlier releases installed, and whether it was toasting.
+func legacyIndicator(layout map[string]any) (present, notified bool) {
+	module := barLayoutModule(layout, omarchyBarModuleID)
+	if module == nil {
+		return false, false
+	}
+	moduleExec, _ := module["exec"].(string)
+	return true, strings.HasSuffix(moduleExec, " --notify")
+}
+
+// removeLegacyIndicator drops the legacy module and writes shell.json. It
+// reloads the file first — the caller may have rewritten it since any
+// earlier look. carryNotify moves the module's toast choice onto the
+// plugin's entry when that entry exists and has not been told either way;
+// configureBarPlugin passes false and lets applyNotify do it instead.
+func (s omarchySetup) removeLegacyIndicator(carryNotify bool) omarchyStep {
+	path := s.env.shellPath()
+	shell, err := s.loadShellConfig()
+	if err != nil {
+		return stepResult("bar indicator", path, false, err, "", "")
+	}
+	layout, err := existingBarLayout(shell)
+	if err != nil {
+		return stepResult("bar indicator", path, false, err, "", "")
+	}
+	present, notified := legacyIndicator(layout)
+	if !present {
+		return omarchyStep{Name: "bar indicator", Path: path, Status: "absent"}
+	}
+	if carryNotify && notified && barLayoutModule(layout, omarchyBarPluginID) == nil {
+		// No entry to hold the key (an enabled plugin needs none): the CLI
+		// materializes it — rewriting shell.json, so the removal below
+		// reloads rather than clobbering the new entry with this stale
+		// snapshot. If the choice cannot land, the toasting module stays
+		// for the next explicit setup rather than dying with the migration.
+		on := true
+		if carried := s.setNotifyWithoutEntry(&on); carried.failure != nil {
+			return carried
 		}
-		steps = append(steps, omarchyStep{Name: "bar plugin", Path: path, Status: "skipped", Detail: detail})
-		return s.writeBarSteps(steps, shell, legacy)
+		if shell, err = s.loadShellConfig(); err != nil {
+			return stepResult("bar indicator", path, false, err, "", "")
+		}
+		if layout, err = existingBarLayout(shell); err != nil {
+			return stepResult("bar indicator", path, false, err, "", "")
+		}
 	}
+	legacy, _ := s.removeLegacyBarModule(shell, layout)
+	if !legacy {
+		return omarchyStep{Name: "bar indicator", Path: path, Status: "absent"}
+	}
+	if carryNotify && notified {
+		if plugin := barLayoutModule(layout, omarchyBarPluginID); plugin != nil {
+			if _, has := plugin["notify"]; !has {
+				plugin["notify"] = true
+			}
+		}
+	}
+	step := omarchyStep{Name: "bar indicator", Path: path, Status: "removed",
+		Detail: "hey-unread module removed; the " + omarchyBarPluginID + " plugin replaces it"}
+	return s.writeBarSteps([]omarchyStep{step}, shell, true)[0]
+}
 
+// mergeNotify reloads shell.json — the install may have rewritten it — and
+// folds the notify outcome into the plugin's one step.
+func (s omarchySetup) mergeNotify(install omarchyStep, legacyNotified bool) omarchyStep {
+	notify := s.applyNotify(legacyNotified)
+	if notify.Status == "failed" {
+		return notify
+	}
+	if install.Status == "installed" {
+		notify.Status = "installed"
+		notify.attempted = true
+		if notify.Detail != "" {
+			notify.Detail = install.Detail + "; " + notify.Detail
+		} else {
+			notify.Detail = install.Detail
+		}
+	}
+	return notify
+}
+
+// applyNotify sets or deletes the plugin entry's notify key, carrying a
+// removed legacy module's choice over when the plugin has none.
+func (s omarchySetup) applyNotify(legacyNotified bool) omarchyStep {
+	path := s.env.shellPath()
+	shell, err := s.loadShellConfig()
+	if err != nil {
+		return stepResult("bar plugin", path, false, err, "", "")
+	}
+	layout, err := existingBarLayout(shell)
+	if err != nil {
+		return stepResult("bar plugin", path, false, err, "", "")
+	}
+	plugin := barLayoutModule(layout, omarchyBarPluginID)
 	want := s.notify
 	if want == nil && legacyNotified {
 		// The legacy module was toasting and the plugin has not been told
 		// either way: keep the user's choice rather than silently turning
 		// the toasts off with the module.
-		if _, has := plugin["notify"]; !has {
+		_, has := plugin["notify"]
+		if plugin == nil || !has {
 			on := true
 			want = &on
 		}
 	}
-	// The plugin step reports its own setting only: a legacy removal in the
-	// same pass is the other step's news.
+	if plugin == nil {
+		return s.setNotifyWithoutEntry(want)
+	}
 	settingChanged := false
 	if want != nil {
 		current, has := plugin["notify"]
@@ -394,7 +499,26 @@ func (s omarchySetup) configureBarPlugin() []omarchyStep {
 	if settingChanged {
 		step.Status = "installed"
 	}
-	return s.writeBarSteps(append(steps, step), shell, legacy || settingChanged)
+	return s.writeBarSteps([]omarchyStep{step}, shell, settingChanged)[0]
+}
+
+// setNotifyWithoutEntry handles an enabled plugin with no spelled-out layout
+// entry to hold the key. Seeding a partial layout would override the shell's
+// whole default layout, so the omarchy CLI materializes the setting instead —
+// and with no entry there is no key, so "off" is already true.
+func (s omarchySetup) setNotifyWithoutEntry(want *bool) omarchyStep {
+	path := s.env.shellPath()
+	if want == nil {
+		return omarchyStep{Name: "bar plugin", Path: path, Status: "unchanged"}
+	}
+	if !*want {
+		return omarchyStep{Name: "bar plugin", Path: path, Status: "unchanged", Detail: notifyDetail(false)}
+	}
+	out, err := s.env.run("omarchy", "bar", "set", omarchyBarPluginID, "notify", "true", "--json")
+	if err != nil {
+		return stepResult("bar plugin", path, false, errors.New(firstOutputLine(out, err)), "", "")
+	}
+	return omarchyStep{Name: "bar plugin", Path: path, Status: "installed", Detail: notifyDetail(true)}
 }
 
 // writeBarSteps writes shell.json when anything changed and turns every
@@ -419,31 +543,26 @@ func barPluginNotifies(plugin map[string]any) bool {
 	return notify
 }
 
-// removeBar takes out what setup wrote into the bar layout: a legacy hey-unread
-// module. The plugin entry and its notify setting stay — the entry is the
-// user's, added with omarchy plugin add, and the setting is the plugin's, set
-// as readily from its panel or `omarchy bar set` as from here, so removal
-// cannot tell a preference it wrote from one it didn't. --no-notify is the
-// explicit way to turn the toasts off.
+// removeBar takes out what setup wrote into the bar layout — a legacy
+// hey-unread module — and disables the plugin, tombstone first, keeping the
+// checkout (removeBarPluginLocked). The entry's notify setting rides with
+// the entry: `omarchy plugin disable` takes both off the bar together. One
+// lock spans the whole sequence, as in configureBarPlugin.
 func (s omarchySetup) removeBar() []omarchyStep {
-	path := s.env.shellPath()
-	shell, err := s.loadShellConfig()
-	if err != nil {
-		return []omarchyStep{stepResult("bar indicator", path, false, err, "", ""), stepResult("bar plugin", path, false, err, "", "")}
+	return s.underBarPluginLock(s.removeBarLocked)
+}
+
+func (s omarchySetup) removeBarLocked() []omarchyStep {
+	// The tombstone (and the disable behind it) land before any layout
+	// rewrite: a stop in between costs only the legacy cleanup, which the
+	// marker does not guard — never the record of the user's intent. And a
+	// removal that could not be recorded or completed rewrites nothing
+	// else either — the rerun does the cleanup.
+	plugin := s.removeBarPluginLocked(s.pluginOnBar())
+	if plugin.Status == "failed" {
+		return []omarchyStep{plugin}
 	}
-	bar, _ := shell["bar"].(map[string]any)
-	layout, _ := bar["layout"].(map[string]any)
-	legacy, _ := s.removeLegacyBarModule(shell, layout)
-	plugin := omarchyStep{Name: "bar plugin", Path: path, Status: "absent"}
-	if entry := barLayoutModule(layout, omarchyBarPluginID); entry != nil {
-		plugin.Status = "kept"
-		plugin.Detail = "the plugin and its notify setting are yours; hey setup omarchy --no-notify turns the toasts off"
-		if !barPluginNotifies(entry) {
-			plugin.Detail = "the plugin is yours; notifications are off"
-		}
-	}
-	steps := []omarchyStep{stepResult("bar indicator", path, legacy, nil, "removed", "absent"), plugin}
-	return s.writeBarSteps(steps, shell, legacy)
+	return []omarchyStep{s.removeLegacyIndicator(false), plugin}
 }
 
 // removeLegacyBarModule drops the inline hey-unread module earlier releases
@@ -637,7 +756,7 @@ func (s omarchySetup) installTemplate() omarchyStep {
 	}
 	changed, err := writeFileIfChanged(path, []byte(omarchyThemeTemplate), 0o644)
 	if err == nil && changed {
-		if refreshErr := s.env.run("omarchy-theme-refresh"); refreshErr != nil {
+		if _, refreshErr := s.env.run("omarchy-theme-refresh"); refreshErr != nil {
 			return omarchyStep{Name: "theme template", Path: path, Status: "installed",
 				Detail: "rendered on the next theme switch (omarchy-theme-refresh unavailable)"}
 		}
@@ -657,7 +776,7 @@ func (s omarchySetup) removeTemplate() omarchyStep {
 	}
 	changed, err := removeFileIfPresent(path)
 	if err == nil && changed {
-		if refreshErr := s.env.run("omarchy-theme-refresh"); refreshErr != nil {
+		if _, refreshErr := s.env.run("omarchy-theme-refresh"); refreshErr != nil {
 			return omarchyStep{Name: "theme template", Path: path, Status: "removed",
 				Detail: "rendered hey.toml stays until the next theme switch (omarchy-theme-refresh unavailable)"}
 		}
@@ -743,13 +862,21 @@ func newSetupOmarchyCommand() *setupOmarchyCommand {
 		Use:   "omarchy",
 		Args:  cobra.NoArgs,
 		Short: "Install hey into the Omarchy desktop",
-		Long: `Install hey into the Omarchy desktop: a launcher entry, rows in the SUPER+SPACE
-menu, and a theme template so themes can tune the TUI's accent colors. Every piece
-is idempotent and --remove takes them all out again — all but the bar plugin's notify
-setting, which is the plugin's own; --no-notify is how to turn that off.
+		Long: `Install hey into the Omarchy desktop: the 37signals.hey bar plugin, a launcher
+entry, rows in the SUPER+SPACE menu, and a theme template so themes can tune the
+TUI's accent colors. Every piece is idempotent.
 
-The bar indicator is the 37signals.hey plugin, which runs hey watch; install it
-with omarchy plugin add https://github.com/basecamp/omarchy-hey-plugin.git --enable.
+Signing in with hey offers the bar plugin on its own, asked once; this command is
+the explicit path — it installs in every output format, finishes an interrupted
+install, re-enables a plugin you disabled, and never reports success unless the
+running shell verified the plugin enabled. The plugin runs hey watch: the HEY
+glyph lights when the Imbox has unseen mail.
+
+--remove disables the bar plugin and keeps its checkout (omarchy plugin remove
+37signals.hey deletes it), and takes the desktop pieces out. A removed or
+disabled plugin stays off the bar until you run hey setup omarchy again — a
+sign-in never re-enables it.
+
 --notify turns on the bar plugin's new-mail toasts (one per batch of changes at
 most, replaced rather than stacked, silenced by the notification DND toggle) by
 setting notify on the plugin's entry in shell.json. --no-notify turns them back
@@ -790,7 +917,7 @@ func (c *setupOmarchyCommand) run(cmd *cobra.Command, args []string) error {
 		return apierr.ErrUsageHint("Omarchy not detected", "hey setup omarchy needs ~/.local/state/omarchy or OMARCHY_PATH")
 	}
 
-	setup := omarchySetup{env: c.env}
+	setup := omarchySetup{env: c.env, forcePlugin: true}
 	if c.notify || c.noNotify {
 		setup.notify = &c.notify
 	}
@@ -822,7 +949,7 @@ func (c *setupOmarchyCommand) run(cmd *cobra.Command, args []string) error {
 			fmt.Fprint(w, omarchyKeybindHint)
 		}
 		if len(failures) > 0 {
-			return fmt.Errorf("%d step(s) failed", len(failures))
+			return setupOmarchyFailure(failures, steps)
 		}
 		return nil
 	}
@@ -836,15 +963,21 @@ func (c *setupOmarchyCommand) run(cmd *cobra.Command, args []string) error {
 		data["keybind_hint"] = omarchyKeybindHint
 	}
 	if len(failures) > 0 {
-		// An operational failure, not a usage error: some steps already changed
-		// files, and they ride along in the error meta so a scripting caller can
-		// see which pieces landed and which did not.
-		return &apierr.Error{
-			Code:    "setup_failed",
-			Message: strings.Join(failures, "; "),
-			Hint:    "fix the paths above and run hey setup omarchy again",
-			Meta:    map[string]any{"steps": steps},
-		}
+		return setupOmarchyFailure(failures, steps)
 	}
 	return writeOK(data, output.WithSummary(summary))
+}
+
+// setupOmarchyFailure is an operational failure, not a usage error: some
+// steps already changed files, and they ride along in the error meta so a
+// scripting caller can see which pieces landed and which did not. An
+// incomplete forced install is a failure in every output format — never a
+// quiet skip.
+func setupOmarchyFailure(failures []string, steps []omarchyStep) error {
+	return &apierr.Error{
+		Code:    "setup_failed",
+		Message: strings.Join(failures, "; "),
+		Hint:    "fix the failures above and run hey setup omarchy again",
+		Meta:    map[string]any{"steps": steps},
+	}
 }
