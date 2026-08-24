@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -230,6 +231,116 @@ func TestAccountSwitchRebuildsViewsAndCancelsOldGeneration(t *testing.T) {
 	}
 	if accountID, ok := m.vc.sdk.AccountID(); !ok || accountID != 2 {
 		t.Fatalf("view SDK account = %d, %v", accountID, ok)
+	}
+}
+
+func TestTopicRequestSwitchesToItsMailAccountBeforeOpening(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":1,"accounts":[{"id":1,"status":"active"},{"id":2,"status":"active"}]}`)
+	}))
+	t.Cleanup(server.Close)
+	root := hey.NewClient(&hey.Config{BaseURL: server.URL}, &hey.StaticTokenProvider{Token: "token"}, hey.WithMaxRetries(0))
+	m := newModelWithMailAccounts(root, root, "all", Watchers{})
+	m.mailAccountsLoaded = true
+	m.mailAccounts = []mailAccountChoice{{label: "All Accounts"}, {id: 2, label: "jane@company.example"}}
+	m.section = sectionCalendar
+	m.activeView = m.calendarView
+
+	updated, cmd := m.Update(TopicRequest{TopicID: 5511, AccountID: 2})
+	m = updated.(model)
+	if cmd == nil || !m.mailAccountSwitching || m.pendingTopic == nil {
+		t.Fatal("topic request did not start its account switch")
+	}
+	switchMsg := cmd().(mailAccountSwitchedMsg)
+	updated, initCmd := m.Update(switchMsg)
+	m = updated.(model)
+	if initCmd == nil || m.mailAccount.id != 2 || m.pendingTopic == nil || m.section != sectionMail || m.activeView != m.mailView {
+		t.Fatalf("topic account switch did not start mail: account=%d pending=%v section=%d", m.mailAccount.id, m.pendingTopic != nil, m.section)
+	}
+
+	updated, openCmd := m.Update(mailSourcesLoadedMsg{})
+	m = updated.(model)
+	if openCmd == nil || m.pendingTopic != nil || m.section != sectionMail {
+		t.Fatalf("topic was not opened after mail loaded: pending=%v section=%d", m.pendingTopic != nil, m.section)
+	}
+
+	request := TopicRequest{TopicID: 6612, AccountID: 1}
+	m.pendingTopic = &request
+	m.mailAccountsLoaded = false
+	updated, failCmd := m.Update(mailAccountsLoadedMsg{err: errors.New("identity unavailable")})
+	m = updated.(model)
+	if failCmd != nil || m.mailAccountsLoaded || m.pendingTopic == nil || m.pendingTopic.AccountID != 1 {
+		t.Fatalf("account discovery failure weakened the topic request: cmd=%v loaded=%v pending=%#v", failCmd != nil, m.mailAccountsLoaded, m.pendingTopic)
+	}
+}
+
+func TestNewCurrentAccountTopicInvalidatesPendingAccountSwitch(t *testing.T) {
+	m := newModel()
+	m.mailAccount = mailAccountChoice{id: 1, label: "jane@example.com"}
+	m.mailSourcesLoaded = true
+	m.mailAccountRequestID = 41
+	m.mailAccountSwitching = true
+	pending := TopicRequest{TopicID: 5511, AccountID: 2}
+	m.pendingTopic = &pending
+	oldMailView := m.mailView
+
+	updated, openCmd := m.Update(TopicRequest{TopicID: 6612, AccountID: 1})
+	m = updated.(model)
+	if openCmd == nil || m.mailAccountSwitching || m.mailAccountRequestID != 42 || m.pendingTopic != nil {
+		t.Fatalf("new topic did not replace the pending switch: cmd=%v switching=%v request=%d pending=%v",
+			openCmd != nil, m.mailAccountSwitching, m.mailAccountRequestID, m.pendingTopic != nil)
+	}
+
+	updated, staleCmd := m.Update(mailAccountSwitchedMsg{
+		requestID: 41,
+		account:   mailAccountChoice{id: 2, label: "jane@company.example"},
+	})
+	m = updated.(model)
+	if staleCmd != nil || m.mailAccount.id != 1 || m.mailView != oldMailView {
+		t.Fatalf("stale switch replaced the current topic: cmd=%v account=%d rebuilt=%v", staleCmd != nil, m.mailAccount.id, m.mailView != oldMailView)
+	}
+}
+
+func TestTopicRequestDoesNotDiscardAnAccountSensitiveAction(t *testing.T) {
+	m := newModel()
+	m.mailAccountsLoaded = true
+	m.mailSourcesLoaded = true
+	m.mailAccounts = []mailAccountChoice{{label: "All Accounts"}, {id: 2, label: "jane@company.example"}}
+	m.mailView.pendingMutations = 1
+
+	for _, accountID := range []int64{2, 0} {
+		updated, cmd := m.Update(TopicRequest{TopicID: 5511, AccountID: accountID})
+		m = updated.(model)
+		if cmd == nil || m.mailAccountSwitching || m.pendingTopic != nil || m.section != sectionMail {
+			t.Fatalf("account %d topic request disturbed a pending action: switching=%v pending=%v section=%d",
+				accountID, m.mailAccountSwitching, m.pendingTopic != nil, m.section)
+		}
+		if _, ok := cmd().(notifyMsg); !ok {
+			t.Fatalf("blocked account %d topic request did not explain why", accountID)
+		}
+	}
+}
+
+func TestTopicRequestDoesNotDiscardAnotherSectionsForm(t *testing.T) {
+	m := newModel()
+	m.mailAccountsLoaded = true
+	m.mailSourcesLoaded = true
+	m.mailAccounts = []mailAccountChoice{{label: "All Accounts"}, {id: 2, label: "jane@company.example"}}
+	m.section = sectionContacts
+	m.activeView = m.contactsView
+	if cmd := m.contactsView.HandleContentKey(keyPress("a")); cmd == nil || !m.contactsView.CapturingInput() {
+		t.Fatal("contact form did not open")
+	}
+
+	updated, cmd := m.Update(TopicRequest{TopicID: 5511, AccountID: 2})
+	m = updated.(model)
+	if cmd == nil || m.mailAccountSwitching || m.pendingTopic != nil || m.section != sectionContacts || m.activeView != m.contactsView || !m.contactsView.CapturingInput() {
+		t.Fatalf("topic request discarded the contact form: switching=%v pending=%v section=%d capturing=%v",
+			m.mailAccountSwitching, m.pendingTopic != nil, m.section, m.contactsView.CapturingInput())
+	}
+	if _, ok := cmd().(notifyMsg); !ok {
+		t.Fatal("blocked topic request did not explain why")
 	}
 }
 
