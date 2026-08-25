@@ -23,9 +23,9 @@ type threadEntry struct {
 	} `json:"creator"`
 }
 
-// firstMessage is the plain text the long thread starts with. compose sends it as
-// text, so in the thread it is prose: the asterisks and the list dashes come back
-// escaped, and the URL comes back as the literal it is.
+// firstMessage is the Markdown the long thread starts with. compose sends -m as
+// Markdown, so in the thread the emphasis and the list survive as structure, and the
+// bare URL stays a literal the reader can follow.
 const firstMessage = "First: the **quarterly** numbers are at https://example.com/reports/q3 — see the bullets\n\n- Revenue up\n- Churn down"
 
 // longThread composes a message and replies to it until the thread is longer than one
@@ -112,17 +112,25 @@ func TestThreadsReadsALongThreadAsMarkdown(t *testing.T) {
 		}
 	}
 
-	// The text was sent as text, so it is prose in the Markdown: the asterisks are
-	// escaped rather than emphasis, the URL is the literal it was, and the em dash —
-	// a multibyte character — survives intact.
+	// The message went in as Markdown, so it comes back as Markdown. The assertions
+	// anchor on the surroundings so weaker shapes cannot sneak through the substring
+	// check: the URL is anchored in its prose (a link or autolink would wrap it in
+	// brackets there), and the list block is anchored on its newlines (an escaped
+	// \- would sit between the newline and the dash).
 	first := entries[0].Body
-	for _, want := range []string{`\*\*quarterly\*\*`, "https://example.com/reports/q3", "— see the bullets", "Revenue up", "Churn down"} {
+	for _, want := range []string{
+		"**quarterly**",
+		"at https://example.com/reports/q3 — see the bullets",
+		"\n- Revenue up\n- Churn down",
+	} {
 		if !strings.Contains(first, want) {
 			t.Errorf("first body = %q, want %q in it", first, want)
 		}
 	}
-	if strings.Contains(first, "**quarterly**") {
-		t.Errorf("first body = %q, want the asterisks escaped, not emphasis", first)
+	for _, reject := range []string{`\*\*quarterly\*\*`, `\-`, "<https://example.com"} {
+		if strings.Contains(first, reject) {
+			t.Errorf("first body = %q, must not contain %q", first, reject)
+		}
 	}
 	if last := entries[len(entries)-1].Body; !strings.Contains(last, fmt.Sprintf("Reply %d of %d", replies, replies)) {
 		t.Errorf("last body = %q, want the last reply", last)
