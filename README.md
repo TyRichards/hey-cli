@@ -240,7 +240,7 @@ identity-wide.
 
 Run `hey tui` to launch the interactive terminal UI (it offers to sign you in first if
 needed). Bare `hey` prints the help — or, logged out at a terminal, runs first-time setup.
-Run `hey tui spacious` for an inset layout with additional breathing room between mail
+Run `hey tui spacious` for a layout with additional breathing room between mail
 rows, or `hey tui classic` for the original edge-to-edge layout. Press Ctrl+G while the
 TUI is open to switch between them; narrow terminals collapse the additional chrome until
 there is room for it again.
